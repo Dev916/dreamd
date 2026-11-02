@@ -13,6 +13,13 @@ use dreamd::db::Db;
 use dreamd::model::{Dream, DreamStatus};
 
 fn main() {
+    // Rust ignores SIGPIPE, so `dreamd diff <id> | head` would panic on EPIPE.
+    // Restore the default so a closed pipe just ends the process quietly.
+    #[cfg(unix)]
+    // SAFETY: resetting a signal disposition before any thread exists.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("DREAMD_LOG")

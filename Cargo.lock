@@ -416,6 +416,7 @@ dependencies = [
  "dirs",
  "filetime",
  "getrandom 0.3.4",
+ "libc",
  "predicates",
  "reqwest",
  "rusqlite",
