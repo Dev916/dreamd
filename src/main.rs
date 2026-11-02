@@ -4,7 +4,9 @@ mod config;
 mod db;
 mod discover;
 mod doctor;
+mod fsops;
 mod model;
+mod postcheck;
 mod transcript;
 mod worker;
 
@@ -186,6 +188,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             transcripts,
             timeout,
         } => mine(&cfg, &dream_dir, transcripts, timeout).await,
+        Command::Postcheck { in_dir, out_dir } => postcheck_cmd(&in_dir, &out_dir),
         _ => anyhow::bail!("not implemented"),
     }
 }
@@ -264,6 +267,34 @@ async fn mine(
         eprintln!("all workers failed");
         return Ok(EXIT_FAILED);
     }
+    Ok(EXIT_OK)
+}
+
+/// `postcheck`: print `violation: …` per new violation (exit 4), else
+/// `ok: N files, +a -r ~c` for the in → out diff.
+fn postcheck_cmd(in_dir: &std::path::Path, out_dir: &std::path::Path) -> anyhow::Result<i32> {
+    use anyhow::Context;
+    for d in [in_dir, out_dir] {
+        anyhow::ensure!(d.is_dir(), "not a directory: {}", d.display());
+    }
+    let violations = postcheck::check(in_dir, out_dir);
+    if !violations.is_empty() {
+        for v in &violations {
+            println!("violation: {v}");
+        }
+        return Ok(EXIT_FAILED);
+    }
+    let (_, s) = fsops::unified_diff(in_dir, out_dir).context("diff in/ → out/")?;
+    let n = walkdir::WalkDir::new(out_dir)
+        .min_depth(1)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .count();
+    println!(
+        "ok: {n} files, +{} -{} ~{}",
+        s.files_added, s.files_removed, s.files_changed
+    );
     Ok(EXIT_OK)
 }
 
