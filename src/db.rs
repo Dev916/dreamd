@@ -211,7 +211,6 @@ impl Db {
         v.flatten().as_deref().map(parse_ts).transpose()
     }
 
-    #[allow(dead_code)] // used by apply (Task 9)
     pub fn set_last_dreamed_at(&self, p: &Project, at: DateTime<Utc>) -> anyhow::Result<()> {
         let conn = self.conn();
         Self::upsert_project_on(&conn, p)?;
@@ -389,7 +388,6 @@ impl Db {
     }
 
     /// Record (or replace) the backup taken when a dream was applied.
-    #[allow(dead_code)] // used by apply (Task 9)
     pub fn record_apply(&self, dream_id: &str, backup_path: &Path) -> anyhow::Result<()> {
         self.conn().execute(
             "INSERT INTO applies (dream_id, applied_at, backup_path) VALUES (?1, ?2, ?3)
@@ -400,7 +398,6 @@ impl Db {
         Ok(())
     }
 
-    #[allow(dead_code)] // used by apply (Task 9)
     pub fn get_apply(&self, dream_id: &str) -> anyhow::Result<Option<PathBuf>> {
         let p: Option<String> = self
             .conn()

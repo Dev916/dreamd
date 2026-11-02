@@ -109,7 +109,7 @@ fn config_show_reflects_env() {
 fn unimplemented_subcommand_exits_1() {
     let tmp = TempDir::new().unwrap();
     dreamd(&tmp)
-        .args(["rollback", "drm_x"])
+        .args(["schedule", "status"])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("not implemented"));

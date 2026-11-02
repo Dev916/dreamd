@@ -1,4 +1,5 @@
 mod aggregate;
+mod apply;
 mod claude;
 mod cli;
 mod config;
@@ -138,6 +139,8 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Diff { id } => artifact_cmd(&cfg, &id, "dream.diff"),
         Command::Summary { id } => artifact_cmd(&cfg, &id, "aggregate.md"),
         Command::Cancel { id } => cancel_cmd(&cfg, &id),
+        Command::Apply { id, force } => apply_cmd(&id, Some(force)),
+        Command::Rollback { id } => apply_cmd(&id, None),
         Command::Scan { all_dirs } => {
             let db = Db::open(&cfg.db_path())?;
             let found = discover::discover(&cfg, &db, chrono::Utc::now())?;
@@ -441,6 +444,50 @@ fn artifact_cmd(cfg: &config::Config, id: &str, file: &str) -> anyhow::Result<i3
         Err(_) => {
             eprintln!("no {file} for {id} (dream is {})", d.status);
             Ok(EXIT_REFUSED)
+        }
+    }
+}
+
+/// `apply` (`force` = `Some`) / `rollback` (`None`): print the paths touched;
+/// refused (not found, bad status, hash mismatch) → exit 3, I/O failure → 4.
+fn apply_cmd(id: &str, force: Option<bool>) -> anyhow::Result<i32> {
+    use apply::ApplyError;
+    let ctx = dream::Ctx::from_env()?;
+    let res = match force {
+        Some(f) => apply::apply(&ctx, id, f),
+        None => apply::rollback(&ctx, id),
+    };
+    match res {
+        Ok(r) => {
+            if force.is_some() {
+                println!(
+                    "applied {}: backup at {}",
+                    r.dream_id,
+                    r.backup_path.display()
+                );
+                println!("memory_dir {}", r.memory_dir.display());
+            } else {
+                println!(
+                    "rolled back {}: restored {} from {}",
+                    r.dream_id,
+                    r.memory_dir.display(),
+                    r.backup_path.display()
+                );
+            }
+            Ok(EXIT_OK)
+        }
+        Err(ApplyError::NotFound) => {
+            eprintln!("dream not found: {id}");
+            Ok(EXIT_REFUSED)
+        }
+        Err(e @ (ApplyError::BadStatus(_) | ApplyError::HashMismatch)) => {
+            eprintln!("refused: {e}");
+            Ok(EXIT_REFUSED)
+        }
+        Err(ApplyError::Io(e)) => {
+            let what = if force.is_some() { "apply" } else { "rollback" };
+            eprintln!("{what} failed: {e}");
+            Ok(EXIT_FAILED)
         }
     }
 }
