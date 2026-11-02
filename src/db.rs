@@ -4,7 +4,6 @@
 //! precision) so they round-trip exactly and sort lexically. Nested values
 //! (`usage`, `diff_stats`, `session_ids`) are JSON text columns.
 // Most methods are consumed by later stages (pipeline, apply, api).
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -160,6 +159,7 @@ impl Db {
     }
 
     /// A private in-memory database (tests).
+    #[cfg_attr(not(test), allow(dead_code))] // unit tests only
     pub fn open_memory() -> anyhow::Result<Db> {
         Self::init(Connection::open_in_memory()?)
     }
@@ -211,6 +211,7 @@ impl Db {
         v.flatten().as_deref().map(parse_ts).transpose()
     }
 
+    #[allow(dead_code)] // used by apply (Task 9)
     pub fn set_last_dreamed_at(&self, p: &Project, at: DateTime<Utc>) -> anyhow::Result<()> {
         let conn = self.conn();
         Self::upsert_project_on(&conn, p)?;
@@ -287,6 +288,15 @@ impl Db {
                 summary,
                 serde_json::to_string(stats)?
             ],
+        )?;
+        expect_one(n, "dream", id)
+    }
+
+    /// Record usage without touching summary or diff stats (failed dreams).
+    pub fn set_usage(&self, id: &str, usage: &Usage) -> anyhow::Result<()> {
+        let n = self.conn().execute(
+            "UPDATE dreams SET usage_json = ?2 WHERE id = ?1",
+            params![id, serde_json::to_string(usage)?],
         )?;
         expect_one(n, "dream", id)
     }
@@ -379,6 +389,7 @@ impl Db {
     }
 
     /// Record (or replace) the backup taken when a dream was applied.
+    #[allow(dead_code)] // used by apply (Task 9)
     pub fn record_apply(&self, dream_id: &str, backup_path: &Path) -> anyhow::Result<()> {
         self.conn().execute(
             "INSERT INTO applies (dream_id, applied_at, backup_path) VALUES (?1, ?2, ?3)
@@ -389,6 +400,7 @@ impl Db {
         Ok(())
     }
 
+    #[allow(dead_code)] // used by apply (Task 9)
     pub fn get_apply(&self, dream_id: &str) -> anyhow::Result<Option<PathBuf>> {
         let p: Option<String> = self
             .conn()

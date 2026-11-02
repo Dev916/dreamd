@@ -15,7 +15,6 @@ pub enum Violation {
     /// A `MEMORY.md` link whose target file does not exist.
     BrokenIndexLink { target: String },
     /// A file outside `out/` under the dream dir was created, modified or removed.
-    #[allow(dead_code)] // consumed by the dream pipeline / apply (Tasks 8–9)
     EscapedWrite(PathBuf),
 }
 
@@ -114,7 +113,6 @@ pub fn check(in_dir: &Path, out_dir: &Path) -> Vec<Violation> {
 }
 
 /// mtime (ns since epoch) of every file under `dream_dir` except the `out/` subtree.
-#[allow(dead_code)] // consumed by the dream pipeline / apply (Tasks 8–9)
 pub fn snapshot_mtimes(dream_dir: &Path) -> BTreeMap<PathBuf, u64> {
     let out_dir = dream_dir.join("out");
     let mut m = BTreeMap::new();
@@ -141,7 +139,6 @@ pub fn snapshot_mtimes(dream_dir: &Path) -> BTreeMap<PathBuf, u64> {
 
 /// Files outside `out/` that appeared, disappeared or changed mtime between
 /// two `snapshot_mtimes` of `dream_dir`.
-#[allow(dead_code)] // consumed by the dream pipeline / apply (Tasks 8–9)
 pub fn check_escapes(
     dream_dir: &Path,
     before: &BTreeMap<PathBuf, u64>,

@@ -58,7 +58,6 @@ fn files(root: &Path) -> io::Result<Vec<Entry>> {
 
 /// Recursively copy `src` into `dst` (created if missing), preserving relative
 /// paths. Symlinks pointing outside `src` are not followed.
-#[allow(dead_code)] // consumed by the dream pipeline / apply (Tasks 8–9)
 pub fn copy_dir(src: &Path, dst: &Path) -> io::Result<()> {
     fs::create_dir_all(dst)?;
     for e in walkdir::WalkDir::new(src).follow_links(false).min_depth(1) {
@@ -79,7 +78,6 @@ pub fn copy_dir(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 /// Hex sha256 over every file's relative path and contents, in sorted path order.
-#[allow(dead_code)] // consumed by the dream pipeline / apply (Tasks 8–9)
 pub fn hash_dir(dir: &Path) -> io::Result<String> {
     let mut h = Sha256::new();
     for f in files(dir)? {

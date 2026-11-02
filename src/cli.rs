@@ -7,7 +7,6 @@ use clap::{Parser, Subcommand};
 
 pub const EXIT_OK: i32 = 0;
 /// Gate-skipped / nothing to do.
-#[allow(dead_code)]
 pub const EXIT_SKIPPED: i32 = 2;
 /// Refused (hash mismatch, bad status, unknown dream).
 pub const EXIT_REFUSED: i32 = 3;
@@ -39,7 +38,11 @@ pub enum Command {
     /// Dream a project (by slug or cwd) or every project with --all.
     Dream {
         /// Project slug or cwd.
-        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        #[arg(
+            required_unless_present = "all",
+            conflicts_with = "all",
+            allow_hyphen_values = true
+        )]
         selector: Option<String>,
         /// Dream every dreamable project (gate applied per project).
         #[arg(long)]
@@ -160,6 +163,16 @@ mod tests {
         let c = Cli::try_parse_from(["dreamd", "dream", "x", "--sessions", "a,b"]).unwrap();
         match c.command {
             Command::Dream { sessions, .. } => assert_eq!(sessions, vec!["a", "b"]),
+            _ => unreachable!(),
+        }
+        let c = Cli::try_parse_from(["dreamd", "dream", "-tmp-proj", "--force"]).unwrap();
+        match c.command {
+            Command::Dream {
+                selector, force, ..
+            } => {
+                assert_eq!(selector.as_deref(), Some("-tmp-proj"));
+                assert!(force);
+            }
             _ => unreachable!(),
         }
     }

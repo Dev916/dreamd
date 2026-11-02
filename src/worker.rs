@@ -57,7 +57,7 @@ session id: {sid}\n\
 #[derive(Debug, Clone)]
 pub struct SessionOutcome {
     pub record: SessionRecord,
-    #[allow(dead_code)] // read by the dream pipeline
+    #[allow(dead_code)] // parsed findings, for in-process callers (API, tests)
     pub findings: Option<Findings>,
 }
 

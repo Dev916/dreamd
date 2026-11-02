@@ -1,11 +1,14 @@
+mod aggregate;
 mod claude;
 mod cli;
 mod config;
 mod db;
 mod discover;
 mod doctor;
+mod dream;
 mod fsops;
 mod model;
+mod notify;
 mod postcheck;
 mod transcript;
 mod worker;
@@ -13,9 +16,9 @@ mod worker;
 use clap::Parser;
 
 use claude::{Claude, ClaudeRequest, CliClaude};
-use cli::{Cli, Command, ConfigAction, EXIT_FAILED, EXIT_OK, EXIT_REFUSED};
+use cli::{Cli, Command, ConfigAction, EXIT_FAILED, EXIT_OK, EXIT_REFUSED, EXIT_SKIPPED};
 use db::Db;
-use model::Dream;
+use model::{Dream, DreamStatus};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -98,9 +101,43 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 println!("{}", serde_json::to_string_pretty(&d)?);
             } else {
                 print!("{}", render_dream(&d));
+                let sessions = db.list_sessions(&d.id)?;
+                if !sessions.is_empty() {
+                    println!("\nsessions:");
+                    for r in &sessions {
+                        match &r.error {
+                            Some(e) => println!("  {}  {}  {e}", r.session_id, r.status),
+                            None => println!(
+                                "  {}  {}  {}ms  cost_usd={:.4}",
+                                r.session_id, r.status, r.duration_ms, r.usage.cost_usd
+                            ),
+                        }
+                    }
+                }
             }
             Ok(EXIT_OK)
         }
+        Command::Dream {
+            selector,
+            all,
+            force,
+            model,
+            instructions,
+            sessions,
+            dry_run,
+        } => {
+            let opts = dream::DreamOpts {
+                force,
+                model,
+                instructions,
+                session_ids: (!sessions.is_empty()).then_some(sessions),
+                dry_run,
+            };
+            dream_cmd(selector.as_deref(), all, opts).await
+        }
+        Command::Diff { id } => artifact_cmd(&cfg, &id, "dream.diff"),
+        Command::Summary { id } => artifact_cmd(&cfg, &id, "aggregate.md"),
+        Command::Cancel { id } => cancel_cmd(&cfg, &id),
         Command::Scan { all_dirs } => {
             let db = Db::open(&cfg.db_path())?;
             let found = discover::discover(&cfg, &db, chrono::Utc::now())?;
@@ -298,6 +335,147 @@ fn postcheck_cmd(in_dir: &std::path::Path, out_dir: &std::path::Path) -> anyhow:
     Ok(EXIT_OK)
 }
 
+/// Find the projects a `dream` selector names: a slug, or a path compared
+/// with each project's cwd. `None` selector = every project (`--all`).
+fn select_projects(
+    found: Vec<discover::DiscoveredProject>,
+    selector: Option<&str>,
+) -> Vec<discover::DiscoveredProject> {
+    let Some(sel) = selector else {
+        return found;
+    };
+    let as_path = std::path::Path::new(sel);
+    let canon = std::fs::canonicalize(as_path).ok();
+    let by_slug: Vec<_> = found
+        .iter()
+        .filter(|d| d.project.slug == sel)
+        .cloned()
+        .collect();
+    if !by_slug.is_empty() {
+        return by_slug.into_iter().take(1).collect();
+    }
+    found
+        .into_iter()
+        .filter(|d| {
+            d.project
+                .cwd
+                .as_deref()
+                .is_some_and(|c| c == as_path || canon.as_deref().is_some_and(|k| k == c))
+        })
+        .take(1)
+        .collect()
+}
+
+/// `dream <selector>|--all`: run the pipeline, print one line per project.
+async fn dream_cmd(
+    selector: Option<&str>,
+    all: bool,
+    opts: dream::DreamOpts,
+) -> anyhow::Result<i32> {
+    let ctx = dream::Ctx::from_env()?;
+    let found = discover::discover(&ctx.cfg, &ctx.db, chrono::Utc::now())?;
+    let targets = select_projects(found, if all { None } else { selector });
+    if targets.is_empty() {
+        if all {
+            println!("no dreamable projects");
+            return Ok(EXIT_SKIPPED);
+        }
+        eprintln!("project not found: {}", selector.unwrap_or_default());
+        return Ok(EXIT_REFUSED);
+    }
+    let (mut completed, mut failed) = (0usize, 0usize);
+    for d in targets {
+        let slug = d.project.slug.clone();
+        match dream::run_dream(&ctx, d, opts.clone()).await? {
+            dream::DreamOutcome::Skipped(_) if opts.dry_run => completed += 1,
+            dream::DreamOutcome::Skipped(why) => println!("skipped {slug}: {why}"),
+            dream::DreamOutcome::Done(dr) => match dr.status {
+                DreamStatus::Completed => {
+                    completed += 1;
+                    let s = dr.diff_stats.unwrap_or_default();
+                    println!(
+                        "dream {} completed: {} sessions mined, +{} -{} ~{} files",
+                        dr.id,
+                        dream::sessions_mined(&ctx.db, &dr.id)?,
+                        s.files_added,
+                        s.files_removed,
+                        s.files_changed
+                    );
+                    println!("{}", dr.output_dir.display());
+                }
+                status => {
+                    failed += 1;
+                    eprintln!(
+                        "dream {} {status}: {}",
+                        dr.id,
+                        dr.error.as_deref().unwrap_or("-")
+                    );
+                    eprintln!("{}", dr.output_dir.display());
+                }
+            },
+        }
+    }
+    Ok(if failed > 0 {
+        EXIT_FAILED
+    } else if completed > 0 {
+        EXIT_OK
+    } else {
+        EXIT_SKIPPED
+    })
+}
+
+/// `diff` / `summary`: print a dream dir artifact verbatim.
+fn artifact_cmd(cfg: &config::Config, id: &str, file: &str) -> anyhow::Result<i32> {
+    let db = Db::open(&cfg.db_path())?;
+    let Some(d) = db.get_dream(id)? else {
+        eprintln!("dream not found: {id}");
+        return Ok(EXIT_REFUSED);
+    };
+    let path = dream::dir_of(&d).join(file);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            use std::io::Write;
+            std::io::stdout().write_all(&bytes)?;
+            Ok(EXIT_OK)
+        }
+        Err(_) => {
+            eprintln!("no {file} for {id} (dream is {})", d.status);
+            Ok(EXIT_REFUSED)
+        }
+    }
+}
+
+/// `cancel`: mark a pending/running dream canceled and SIGTERM its process.
+fn cancel_cmd(cfg: &config::Config, id: &str) -> anyhow::Result<i32> {
+    let db = Db::open(&cfg.db_path())?;
+    let Some(d) = db.get_dream(id)? else {
+        eprintln!("dream not found: {id}");
+        return Ok(EXIT_REFUSED);
+    };
+    if !matches!(d.status, DreamStatus::Pending | DreamStatus::Running) {
+        eprintln!("refused: dream is {}", d.status);
+        return Ok(EXIT_REFUSED);
+    }
+    db.update_status(id, DreamStatus::Canceled, None)?;
+    if let Some(pid) = d.pid.filter(|p| *p != std::process::id()) {
+        if pid_alive(pid) {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+        }
+    }
+    println!("canceled {id}");
+    Ok(EXIT_OK)
+}
+
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Human-readable `show` output.
 fn render_dream(d: &Dream) -> String {
     let opt = |v: Option<String>| v.unwrap_or_else(|| "-".into());
@@ -318,7 +496,7 @@ fn render_dream(d: &Dream) -> String {
     line(
         "usage",
         format!(
-            "{} in / {} out tokens, ${:.4}",
+            "{} in / {} out tokens, cost_usd={:.4}",
             d.usage.input_tokens, d.usage.output_tokens, d.usage.cost_usd
         ),
     );

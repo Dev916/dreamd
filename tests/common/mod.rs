@@ -103,6 +103,7 @@ pub fn cmd(f: &Fixture) -> assert_cmd::Command {
             "DREAMD_CLAUDE_BIN",
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/stub-claude.sh"),
         )
+        .env("DREAMD_NO_NOTIFY", "1")
         .env_remove("DREAMD_LOG");
     c
 }

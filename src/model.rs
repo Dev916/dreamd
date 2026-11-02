@@ -1,6 +1,5 @@
 //! Data model shared by the pipeline, the store and the API.
 // Most of these types are produced/consumed by later stages (pipeline, api).
-#![allow(dead_code)]
 
 use std::fmt;
 use std::ops::AddAssign;

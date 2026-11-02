@@ -111,7 +111,6 @@ impl Default for ScheduleCfg {
 
 impl Config {
     /// `<data_dir>/dreams`, one subdirectory per dream.
-    #[allow(dead_code)] // used by the dream pipeline
     pub fn dreams_dir(&self) -> PathBuf {
         self.data_dir.join("dreams")
     }
