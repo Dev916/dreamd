@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "dreamd",
+  "project_id": "908f963d-e2db-44c7-a93f-06eb5e0e610e"
+}
