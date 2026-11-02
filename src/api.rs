@@ -1,6 +1,18 @@
 //! Loopback HTTP API (`dreamd serve`). JSON over HTTP on 127.0.0.1 only;
 //! errors are RFC 7807 `application/problem+json`.
 //!
+//! Request guards (one middleware layer, in order), because binding to
+//! loopback alone does not stop a web page in the user's browser from
+//! reaching the API (DNS rebinding, cross-site POST):
+//! 1. `Host` must be `127.0.0.1` or `localhost`, bare or with the bound
+//!    port → else 403 `forbidden`. Defeats DNS rebinding.
+//! 2. An `Origin` header other than exactly `null` → 403 `forbidden`.
+//!    Browsers send Origin on cross-site requests; curl/SDKs never do.
+//! 3. Every route but `GET /healthz` needs `Authorization: Bearer <token>`
+//!    matching `<data_dir>/api-token` (constant-time) → else 401.
+//! 4. POST: a `Content-Type`, if present, must be `application/json`
+//!    (parameters allowed); `POST /v1/dreams` must send one → else 415.
+//!
 //! Dreams started here run as background tasks in the server process and
 //! persist their state in SQLite, so the CLI sees them. They record no pid:
 //! cancel (from the API or the CLI) works through the status column, which
@@ -9,8 +21,9 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -125,8 +138,112 @@ struct ApplyQuery {
     force: bool,
 }
 
-/// The API routes.
-pub fn router(state: AppState) -> Router {
+/// What the request guards check against: the bearer token and the port
+/// the server is bound to (for the `Host` allowlist).
+#[derive(Debug, Clone)]
+pub struct Guard {
+    pub token: String,
+    pub port: u16,
+}
+
+impl Guard {
+    fn host_ok(&self, host: &str) -> bool {
+        let (name, port) = match host.rsplit_once(':') {
+            Some((n, p)) => (n, Some(p)),
+            None => (host, None),
+        };
+        let name_ok = name == "127.0.0.1" || name.eq_ignore_ascii_case("localhost");
+        let port_ok = match port {
+            None => true,
+            Some(p) => p.parse::<u16>().ok() == Some(self.port),
+        };
+        name_ok && port_ok
+    }
+
+    fn token_ok(&self, headers: &HeaderMap) -> bool {
+        let Some(v) = headers.get(header::AUTHORIZATION) else {
+            return false;
+        };
+        let Some(given) = v.as_bytes().strip_prefix(b"Bearer ") else {
+            return false;
+        };
+        crate::token::ct_eq(given, self.token.as_bytes())
+    }
+}
+
+fn forbidden(detail: String) -> Problem {
+    Problem::new(StatusCode::FORBIDDEN, "forbidden", detail)
+}
+
+fn unsupported(detail: impl Into<String>) -> Problem {
+    Problem::new(
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "unsupported media type",
+        detail,
+    )
+}
+
+/// The request guards (see module docs). Runs before routing, so it also
+/// covers the fallback.
+async fn guard(State(g): State<Arc<Guard>>, req: Request, next: Next) -> Response {
+    match check(&g, &req) {
+        Ok(()) => next.run(req).await,
+        Err(p) => p.into_response(),
+    }
+}
+
+fn check(g: &Guard, req: &Request) -> Result<(), Problem> {
+    let headers = req.headers();
+    // 1. Host (HTTP/1: Host header; HTTP/2: :authority).
+    let host = match headers.get(header::HOST) {
+        Some(h) => h.to_str().ok().map(str::to_string),
+        None => req.uri().authority().map(|a| a.to_string()),
+    };
+    match host {
+        Some(h) if g.host_ok(&h) => {}
+        Some(h) => return Err(forbidden(format!("host not allowed: {h:?}"))),
+        None => return Err(forbidden("missing host header".into())),
+    }
+    // 2. Origin.
+    if let Some(o) = headers.get(header::ORIGIN) {
+        if o.as_bytes() != b"null" {
+            return Err(forbidden(format!(
+                "cross-origin requests are not allowed (origin {:?})",
+                String::from_utf8_lossy(o.as_bytes())
+            )));
+        }
+    }
+    // 3. Bearer token on everything but /healthz.
+    if req.uri().path() != "/healthz" && !g.token_ok(headers) {
+        return Err(Problem::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing or invalid bearer token (see `dreamd token`)",
+        ));
+    }
+    // 4. JSON content type on POST.
+    if req.method() == Method::POST {
+        match headers.get(header::CONTENT_TYPE) {
+            Some(ct) => {
+                let ct = String::from_utf8_lossy(ct.as_bytes());
+                let mime = ct.split(';').next().unwrap_or("").trim();
+                if !mime.eq_ignore_ascii_case("application/json") {
+                    return Err(unsupported(format!(
+                        "content-type must be application/json, got {ct:?}"
+                    )));
+                }
+            }
+            None if req.uri().path() == "/v1/dreams" => {
+                return Err(unsupported("content-type application/json is required"));
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+/// The API routes, behind the request guards.
+pub fn router(state: AppState, guard_cfg: Guard) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/projects", get(projects))
@@ -139,16 +256,25 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/dreams/{id}/rollback", post(rollback_dream))
         .fallback(|| async { Problem::not_found("no such route") })
         .with_state(state)
+        .layer(middleware::from_fn_with_state(Arc::new(guard_cfg), guard))
 }
 
-/// Bind `127.0.0.1:port` (0 = ephemeral), print
-/// `listening on http://127.0.0.1:<port>`, serve until ctrl-c.
+/// Bind `127.0.0.1:port` (0 = ephemeral), load or create the API token,
+/// print `listening on http://127.0.0.1:<port>` then `token file: <path>`
+/// (never the token), serve until ctrl-c.
 pub async fn serve(ctx: Ctx, port: u16) -> anyhow::Result<()> {
+    let token = crate::token::ensure(&ctx.cfg.data_dir)?;
+    let token_file = crate::token::path(&ctx.cfg.data_dir);
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     println!("listening on http://{bound}");
-    let app = router(AppState(Arc::new(ctx)));
+    println!("token file: {}", token_file.display());
+    let guard_cfg = Guard {
+        token,
+        port: bound.port(),
+    };
+    let app = router(AppState(Arc::new(ctx)), guard_cfg);
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

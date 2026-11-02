@@ -4,6 +4,10 @@
 //!
 //! Everything is one test because the fixture is wired through process env
 //! (`config::load` reads `DREAMD_*`), which tests in one binary would share.
+//!
+//! The request guards (bearer token, Host, Origin, JSON content type) are
+//! exercised raw first; every other request uses a client that sends the
+//! token from `<data_dir>/api-token`.
 
 mod common;
 
@@ -12,17 +16,24 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use dreamd::api::{router, AppState};
+use dreamd::api::{router, AppState, Guard};
 use dreamd::claude::{Claude, ClaudeError, ClaudeRequest, ClaudeResult};
 use dreamd::dream::Ctx;
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::{Client, Response, StatusCode};
 use serde_json::{json, Value};
 
-/// Start `router` on 127.0.0.1:0; return the base URL.
+/// Start `router` on 127.0.0.1:0 with the token from the fixture data dir;
+/// return the base URL.
 async fn start(ctx: Ctx) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = router(AppState(Arc::new(ctx)));
+    let token = dreamd::token::ensure(&ctx.cfg.data_dir).unwrap();
+    let guard = Guard {
+        token,
+        port: addr.port(),
+    };
+    let app = router(AppState(Arc::new(ctx)), guard);
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     format!("http://{addr}")
 }
@@ -84,6 +95,218 @@ impl Claude for SlowClaude {
     }
 }
 
+/// Guard cases against a live server. `raw` sends no token by default.
+async fn guards(base: &str, token: &str) {
+    let raw = Client::new();
+    let bearer = format!("Bearer {token}");
+    let port = base.rsplit(':').next().unwrap().to_string();
+
+    // healthz: open without a token.
+    let r = raw.get(format!("{base}/healthz")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+
+    // 401: missing token, wrong token, wrong scheme — on GET and POST routes.
+    for (path, post) in [
+        ("/v1/projects", false),
+        ("/v1/dreams", false),
+        ("/v1/dreams/drm_x", false),
+        ("/v1/dreams/drm_x/diff", false),
+        ("/v1/dreams/drm_x/sessions", false),
+        ("/v1/dreams/drm_x/cancel", true),
+        ("/v1/dreams/drm_x/apply", true),
+        ("/v1/dreams/drm_x/rollback", true),
+    ] {
+        let url = format!("{base}{path}");
+        let req = |auth: Option<String>| {
+            let b = if post { raw.post(&url) } else { raw.get(&url) };
+            match auth {
+                Some(a) => b.header(AUTHORIZATION, a),
+                None => b,
+            }
+        };
+        problem(
+            req(None).send().await.unwrap(),
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        )
+        .await;
+        let wrong = format!("Bearer {}", "0".repeat(64));
+        problem(
+            req(Some(wrong)).send().await.unwrap(),
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        )
+        .await;
+        problem(
+            req(Some(format!("Basic {token}"))).send().await.unwrap(),
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        )
+        .await;
+        problem(
+            req(Some(token.to_string())).send().await.unwrap(),
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        )
+        .await;
+    }
+    let r = raw
+        .post(format!("{base}/v1/dreams"))
+        .json(&json!({"project": "x"}))
+        .send()
+        .await
+        .unwrap();
+    problem(r, StatusCode::UNAUTHORIZED, "unauthorized").await;
+
+    // Allowed Host forms (authenticated).
+    for host in [
+        "127.0.0.1".to_string(),
+        format!("127.0.0.1:{port}"),
+        "localhost".to_string(),
+        format!("localhost:{port}"),
+    ] {
+        let r = raw
+            .get(format!("{base}/v1/dreams"))
+            .header("host", &host)
+            .header(AUTHORIZATION, &bearer)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "host {host}");
+    }
+
+    // 403: bad Host — even on healthz and even with a valid token.
+    for host in [
+        "evil.example".to_string(),
+        format!("evil.example:{port}"),
+        "127.0.0.1:1".to_string(),
+        "localhost.evil.example".to_string(),
+        format!("127.0.0.2:{port}"),
+    ] {
+        for path in ["/healthz", "/v1/projects"] {
+            let r = raw
+                .get(format!("{base}{path}"))
+                .header("host", &host)
+                .header(AUTHORIZATION, &bearer)
+                .send()
+                .await
+                .unwrap();
+            let body = problem(r, StatusCode::FORBIDDEN, "forbidden").await;
+            assert!(
+                body["detail"].as_str().unwrap().contains("host"),
+                "{host} {path}: {body}"
+            );
+        }
+    }
+
+    // 403: any Origin but exactly `null` — even with a valid token.
+    for origin in [
+        "http://evil.example".to_string(),
+        format!("http://127.0.0.1:{port}"),
+        "http://localhost".to_string(),
+        "NULL".to_string(),
+    ] {
+        for (path, post) in [
+            ("/healthz", false),
+            ("/v1/projects", false),
+            ("/v1/dreams/drm_x/apply", true),
+        ] {
+            let url = format!("{base}{path}");
+            let b = if post { raw.post(&url) } else { raw.get(&url) };
+            let r = b
+                .header("origin", &origin)
+                .header(AUTHORIZATION, &bearer)
+                .send()
+                .await
+                .unwrap();
+            let body = problem(r, StatusCode::FORBIDDEN, "forbidden").await;
+            assert!(
+                body["detail"].as_str().unwrap().contains("origin"),
+                "{origin} {path}: {body}"
+            );
+        }
+    }
+    // Origin: null passes (to the route's own 404).
+    let r = raw
+        .post(format!("{base}/v1/dreams/drm_x/apply"))
+        .header("origin", "null")
+        .header(AUTHORIZATION, &bearer)
+        .send()
+        .await
+        .unwrap();
+    problem(r, StatusCode::NOT_FOUND, "not found").await;
+
+    // 415: POST /v1/dreams without Content-Type, or with a non-JSON one.
+    let body = r#"{"project":"-no-such-project"}"#;
+    let r = raw
+        .post(format!("{base}/v1/dreams"))
+        .header(AUTHORIZATION, &bearer)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    problem(
+        r,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "unsupported media type",
+    )
+    .await;
+    for ct in [
+        "text/plain",
+        "application/x-www-form-urlencoded",
+        "multipart/form-data; boundary=x",
+        "application/jsonx",
+    ] {
+        let r = raw
+            .post(format!("{base}/v1/dreams"))
+            .header(AUTHORIZATION, &bearer)
+            .header("content-type", ct)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        problem(
+            r,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported media type",
+        )
+        .await;
+        // Bodyless POSTs reject a non-JSON header too.
+        let r = raw
+            .post(format!("{base}/v1/dreams/drm_x/cancel"))
+            .header(AUTHORIZATION, &bearer)
+            .header("content-type", ct)
+            .send()
+            .await
+            .unwrap();
+        problem(
+            r,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported media type",
+        )
+        .await;
+    }
+    // JSON with parameters is accepted (route's own 404).
+    let r = raw
+        .post(format!("{base}/v1/dreams"))
+        .header(AUTHORIZATION, &bearer)
+        .header("content-type", "Application/JSON; charset=utf-8")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    problem(r, StatusCode::NOT_FOUND, "not found").await;
+    // Bodyless POST with JSON header is accepted.
+    let r = raw
+        .post(format!("{base}/v1/dreams/drm_x/rollback"))
+        .header(AUTHORIZATION, &bearer)
+        .header("content-type", "application/json")
+        .send()
+        .await
+        .unwrap();
+    problem(r, StatusCode::NOT_FOUND, "not found").await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn api_end_to_end() {
     let f = common::fixture();
@@ -99,7 +322,17 @@ async fn api_end_to_end() {
     std::env::set_var("DREAMD_STUB_MODE", "auto");
     let ctx = Ctx::from_env().unwrap();
     let base = start(ctx.clone()).await;
-    let c = Client::new();
+    let token = std::fs::read_to_string(f.data_dir.join("api-token")).unwrap();
+    let token = token.trim().to_string();
+    assert_eq!(token.len(), 64);
+    guards(&base, &token).await;
+
+    let mut auth = HeaderMap::new();
+    auth.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+    );
+    let c = Client::builder().default_headers(auth).build().unwrap();
 
     // healthz
     let r = c.get(format!("{base}/healthz")).send().await.unwrap();

@@ -1,5 +1,5 @@
 use dreamd::{
-    api, apply, cli, config, discover, doctor, dream, fsops, model, postcheck, schedule,
+    api, apply, cli, config, discover, doctor, dream, fsops, model, postcheck, schedule, token,
     transcript, worker,
 };
 
@@ -225,6 +225,10 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             let port = port.unwrap_or(cfg.port);
             let ctx = dream::Ctx::new(cfg)?;
             api::serve(ctx, port).await?;
+            Ok(EXIT_OK)
+        }
+        Command::Token => {
+            println!("{}", token::ensure(&cfg.data_dir)?);
             Ok(EXIT_OK)
         }
         Command::Schedule { action } => {

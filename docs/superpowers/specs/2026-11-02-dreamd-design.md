@@ -90,6 +90,7 @@ The aggregator reads model-generated findings mined from transcripts, so it is t
 - **Escape and live-dir checks (fail closed).** Anything outside `out/` under the dream dir that changes fails the dream, and so does any change to the live memory dir's content hash during aggregation (defence in depth; acceptEdits already denies those writes).
 - **Permission-mode assertion.** dreamd parses `permissionMode` from each run's `system/init` event. The aggregator must report `acceptEdits` and each worker `plan`; a mismatch fails the dream (or that worker's session) with a hint that `claude_bin` may be a bypass wrapper.
 - **Wrapper detection.** At startup (`Ctx::new`) and in `doctor` (`claude permissions`), dreamd resolves `claude_bin` via `PATH`; if it is a text script containing `--dangerously-skip-permissions` dreamd refuses to run (override: `DREAMD_ALLOW_BYPASS_WRAPPER=1`, for tests only). **The account-rotating wrapper at `~/.local/bin/claude` cannot be used as `claude_bin`**: it always prepends `--dangerously-skip-permissions`, which turns every run into `bypassPermissions` (observed in the init event) and voids all of the above. Point `claude_bin` at the real binary (e.g. `~/.local/bin/_claude`).
+- **Loopback API guards.** Binding to 127.0.0.1 does not stop a web page in the user's browser from reaching the API (DNS rebinding: a hostname re-pointed at 127.0.0.1; cross-site `POST` from any origin). Every request passes one axum middleware layer, in order: (1) `Host` must be `127.0.0.1`, `127.0.0.1:<port>`, `localhost` or `localhost:<port>` (the bound port), else 403 `forbidden` — a rebound request carries the attacker's host name; (2) an `Origin` header other than exactly `null` gets 403 `forbidden` — browsers send Origin on cross-site requests, curl and SDK clients never do; (3) every route except `GET /healthz` requires `Authorization: Bearer <token>`, compared in constant time with `<data_dir>/api-token`, else 401 `unauthorized`; (4) a `POST` whose `Content-Type` is present must be `application/json` (parameters allowed), and `POST /v1/dreams` must send it, else 415 `unsupported media type` — this rules out the "simple" content types an HTML form can send without a CORS preflight. The token is 32 random bytes (hex), created with mode 0600 on first `serve` (or `dreamd token`) and reused after; `serve` prints the file's path, never the token. `doctor` reports `api token` ok (absent, or 0600) or FAIL when group/other can access it.
 
 ### Apply / rollback
 
@@ -103,6 +104,7 @@ dreamd dream <slug|cwd|--all> [--force] [--model M] [--instructions "…"] [--se
 dreamd list | show <id> | diff <id> | summary <id> | cancel <id>
 dreamd apply <id> [--force] | rollback <id>
 dreamd serve [--port 7720]
+dreamd token                              # print the API bearer token (creates it if absent)
 dreamd schedule install|uninstall|status   # launchd dev.dreamd.nightly
 dreamd doctor                             # claude on PATH, config dirs, db, disk
 ```
@@ -111,6 +113,8 @@ Exit codes: 0 ok, 2 gate-skipped/nothing to do, 3 refused (hash mismatch, bad st
 ### HTTP API (`dreamd serve`, 127.0.0.1 only)
 
 `GET /v1/projects`, `POST /v1/dreams {project, instructions?, model?, session_ids?, force?}` → 202 dream, `GET /v1/dreams[?status=]`, `GET /v1/dreams/{id}`, `GET /v1/dreams/{id}/diff` (text/plain), `GET /v1/dreams/{id}/sessions`, `POST /v1/dreams/{id}/cancel|apply|rollback`, `GET /healthz`. Dreams started over HTTP run as background tasks in the server process and persist state in SQLite so the CLI sees them. Errors are RFC 7807 problem JSON.
+
+Every route except `/healthz` requires `Authorization: Bearer <token>`, the token being the content of `<data_dir>/api-token` (created mode 0600 on first `serve`; `dreamd token` prints it, e.g. `curl -H "Authorization: Bearer $(dreamd token)" http://127.0.0.1:7720/v1/projects`); missing or wrong → 401 `unauthorized`. Every route, `/healthz` included, answers 403 `forbidden` to a `Host` other than `127.0.0.1`/`localhost` (bare or with the bound port) and to any `Origin` other than `null`. `POST` bodies must be `Content-Type: application/json` (`POST /v1/dreams` must send the header; bodyless `cancel|apply|rollback` may omit it), else 415 `unsupported media type`. `serve` prints `listening on http://127.0.0.1:<port>` then `token file: <path>`. See Security model.
 
 ### Scheduling
 

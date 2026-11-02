@@ -86,6 +86,8 @@ pub enum Command {
         #[arg(long)]
         port: Option<u16>,
     },
+    /// Print the API bearer token (creating `<data_dir>/api-token` if absent).
+    Token,
     /// Manage the nightly launchd job (dev.dreamd.nightly).
     Schedule {
         #[command(subcommand)]

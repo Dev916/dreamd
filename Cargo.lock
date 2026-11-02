@@ -415,6 +415,7 @@ dependencies = [
  "clap",
  "dirs",
  "filetime",
+ "getrandom 0.3.4",
  "predicates",
  "reqwest",
  "rusqlite",

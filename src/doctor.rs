@@ -21,6 +21,7 @@ pub fn run(cfg: &Config) -> Vec<Check> {
         check_config_dirs(&cfg.config_dirs),
         check_data_dir(&cfg.data_dir),
         check_database(&cfg.db_path()),
+        check_api_token(&cfg.data_dir),
     ]
 }
 
@@ -102,6 +103,32 @@ fn check_database(path: &Path) -> Check {
             Ok(_) => path.display().to_string(),
             Err(e) => format!("{}: {e}", path.display()),
         },
+    }
+}
+
+/// ok when the token file is absent (created on first `serve`) or 0600;
+/// FAIL when group/other have any access.
+fn check_api_token(data_dir: &Path) -> Check {
+    let file = crate::token::path(data_dir);
+    let (ok, detail) = match crate::token::mode(data_dir) {
+        Ok(None) => (
+            true,
+            format!("{} (absent; created on first serve)", file.display()),
+        ),
+        Ok(Some(m)) if m & 0o077 == 0 => (true, format!("{} ({m:04o})", file.display())),
+        Ok(Some(m)) => (
+            false,
+            format!(
+                "{} ({m:04o}): readable beyond the owner; run `chmod 600` on it",
+                file.display()
+            ),
+        ),
+        Err(e) => (false, format!("{}: {e}", file.display())),
+    };
+    Check {
+        name: "api token",
+        ok,
+        detail,
     }
 }
 
