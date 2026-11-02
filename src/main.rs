@@ -4,6 +4,7 @@ mod db;
 mod discover;
 mod doctor;
 mod model;
+mod transcript;
 
 use clap::Parser;
 
@@ -117,6 +118,16 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             }
             for r in &rows {
                 println!("{}", r.render());
+            }
+            Ok(EXIT_OK)
+        }
+        Command::Digest { path, max_bytes } => {
+            let max = max_bytes.unwrap_or(cfg.worker.max_transcript_bytes);
+            let d = transcript::reduce(&path, max)?;
+            print!("{}", d.text);
+            if d.skipped_lines > 0 {
+                let s = if d.skipped_lines == 1 { "" } else { "s" };
+                eprintln!("skipped {} malformed line{s}", d.skipped_lines);
             }
             Ok(EXIT_OK)
         }
