@@ -16,5 +16,6 @@ pub mod fsops;
 pub mod model;
 pub mod notify;
 pub mod postcheck;
+pub mod schedule;
 pub mod transcript;
 pub mod worker;

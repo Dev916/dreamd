@@ -110,13 +110,3 @@ fn config_show_reflects_env() {
     assert_eq!(v["worker"]["model"].as_str(), Some("sonnet"));
     assert_eq!(v["schedule"]["minute"].as_integer(), Some(30));
 }
-
-#[test]
-fn unimplemented_subcommand_exits_1() {
-    let tmp = TempDir::new().unwrap();
-    dreamd(&tmp)
-        .args(["schedule", "status"])
-        .assert()
-        .code(1)
-        .stderr(predicate::str::contains("not implemented"));
-}

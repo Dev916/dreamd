@@ -1,5 +1,4 @@
-//! Command-line surface. Every subcommand from the spec is declared here;
-//! ones not yet implemented bail with "not implemented" (exit 1).
+//! Command-line surface: every subcommand from the spec.
 
 use std::path::PathBuf;
 
@@ -134,8 +133,15 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum ScheduleAction {
-    Install,
+    /// Write ~/Library/LaunchAgents/dev.dreamd.nightly.plist and load it.
+    Install {
+        /// Print the plist that would be written; change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Unload and remove the plist.
     Uninstall,
+    /// Print whether the job is installed and when it runs.
     Status,
 }
 

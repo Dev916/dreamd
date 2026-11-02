@@ -1,10 +1,13 @@
 use dreamd::{
-    api, apply, cli, config, discover, doctor, dream, fsops, model, postcheck, transcript, worker,
+    api, apply, cli, config, discover, doctor, dream, fsops, model, postcheck, schedule,
+    transcript, worker,
 };
 
 use clap::Parser;
 
-use cli::{Cli, Command, ConfigAction, EXIT_FAILED, EXIT_OK, EXIT_REFUSED, EXIT_SKIPPED};
+use cli::{
+    Cli, Command, ConfigAction, ScheduleAction, EXIT_FAILED, EXIT_OK, EXIT_REFUSED, EXIT_SKIPPED,
+};
 use dreamd::claude::{Claude, ClaudeRequest, CliClaude};
 use dreamd::db::Db;
 use dreamd::model::{Dream, DreamStatus};
@@ -224,7 +227,28 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             api::serve(ctx, port).await?;
             Ok(EXIT_OK)
         }
-        _ => anyhow::bail!("not implemented"),
+        Command::Schedule { action } => {
+            match action {
+                ScheduleAction::Install { dry_run } => schedule::install(&cfg, dry_run)?,
+                ScheduleAction::Uninstall => schedule::uninstall()?,
+                ScheduleAction::Status => {
+                    let st = schedule::status()?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&st)?);
+                    } else if st.installed {
+                        println!(
+                            "installed: daily at {:02}:{:02} ({})",
+                            st.hour,
+                            st.minute,
+                            schedule::plist_path().display()
+                        );
+                    } else {
+                        println!("not installed");
+                    }
+                }
+            }
+            Ok(EXIT_OK)
+        }
     }
 }
 
@@ -350,10 +374,21 @@ async fn dream_cmd(
         eprintln!("project not found: {}", selector.unwrap_or_default());
         return Ok(EXIT_REFUSED);
     }
+    let auto_apply = all && ctx.cfg.schedule.auto_apply && !opts.dry_run;
     let (mut completed, mut failed) = (0usize, 0usize);
     for d in targets {
         let slug = d.project.slug.clone();
-        match dream::run_dream(&ctx, d, opts.clone()).await? {
+        let outcome = match dream::run_dream(&ctx, d, opts.clone()).await {
+            Ok(o) => o,
+            // --all keeps going past one broken project (nightly job).
+            Err(e) if all => {
+                failed += 1;
+                eprintln!("dream {slug} error: {e:#}");
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        match outcome {
             dream::DreamOutcome::Skipped(_) if opts.dry_run => completed += 1,
             dream::DreamOutcome::Skipped(why) => println!("skipped {slug}: {why}"),
             dream::DreamOutcome::Done(dr) => match dr.status {
@@ -369,6 +404,22 @@ async fn dream_cmd(
                         s.files_changed
                     );
                     println!("{}", dr.output_dir.display());
+                    if auto_apply {
+                        match apply::apply(&ctx, &dr.id, false) {
+                            Ok(r) => println!(
+                                "applied {}: backup at {}",
+                                r.dream_id,
+                                r.backup_path.display()
+                            ),
+                            Err(e @ apply::ApplyError::HashMismatch) => {
+                                eprintln!("warning: not applying {}: {e}", dr.id)
+                            }
+                            Err(e) => {
+                                failed += 1;
+                                eprintln!("apply {} failed: {e}", dr.id);
+                            }
+                        }
+                    }
                 }
                 status => {
                     failed += 1;

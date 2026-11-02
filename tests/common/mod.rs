@@ -1,5 +1,6 @@
 //! Shared integration-test fixture: a temp Claude config dir with one
-//! project (`-tmp-proj`), a memory dir and three aged transcripts.
+//! project (`-tmp-proj`) — or n (`fixture_with_projects`) — each with a
+//! memory dir and three aged transcripts.
 // Each test crate uses a different subset of these helpers.
 #![allow(dead_code)]
 
@@ -49,11 +50,48 @@ fn set_mtime(path: &Path, t: SystemTime) {
 pub fn fixture() -> Fixture {
     let root = TempDir::new().unwrap();
     let config_dir = root.path().join("claude");
-    let project_dir = config_dir.join("projects").join(SLUG);
-    let memory_dir = project_dir.join("memory");
     let data_dir = root.path().join("data");
-    std::fs::create_dir_all(&memory_dir).unwrap();
     std::fs::create_dir_all(&data_dir).unwrap();
+    let project_dir = add_project(&config_dir, SLUG);
+    let memory_dir = project_dir.join("memory");
+    Fixture {
+        root,
+        config_dir,
+        project_dir,
+        memory_dir,
+        data_dir,
+    }
+}
+
+/// `n` projects `-tmp-proj-1..=n`, each with memory + 3 aged transcripts.
+/// `project_dir`/`memory_dir` point at `-tmp-proj-1`.
+pub fn fixture_with_projects(n: usize) -> Fixture {
+    assert!(n >= 1);
+    let root = TempDir::new().unwrap();
+    let config_dir = root.path().join("claude");
+    let data_dir = root.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let mut first = None;
+    for i in 1..=n {
+        let dir = add_project(&config_dir, &format!("{SLUG}-{i}"));
+        first.get_or_insert(dir);
+    }
+    let project_dir = first.unwrap();
+    let memory_dir = project_dir.join("memory");
+    Fixture {
+        root,
+        config_dir,
+        project_dir,
+        memory_dir,
+        data_dir,
+    }
+}
+
+/// `<config_dir>/projects/<slug>` with a memory dir and 3 aged transcripts.
+pub fn add_project(config_dir: &Path, slug: &str) -> PathBuf {
+    let project_dir = config_dir.join("projects").join(slug);
+    let memory_dir = project_dir.join("memory");
+    std::fs::create_dir_all(&memory_dir).unwrap();
 
     let two_hours_ago = SystemTime::now() - Duration::from_secs(2 * 3600);
     for name in ["s1.jsonl", "s2.jsonl", "s3.jsonl"] {
@@ -78,14 +116,7 @@ pub fn fixture() -> Fixture {
         "---\nname: fact-b\ndescription: Deploy config lives in infra/\nmetadata:\n  type: project\n---\n\nDeploy configuration is `infra/deploy.yaml`.\n",
     )
     .unwrap();
-
-    Fixture {
-        root,
-        config_dir,
-        project_dir,
-        memory_dir,
-        data_dir,
-    }
+    project_dir
 }
 
 /// Set a file's mtime to now - 2h (an aged, dreamable transcript).
