@@ -55,6 +55,9 @@ pub struct ClaudeResult {
     pub usage: Usage,
     pub duration_ms: u64,
     pub session_id: String,
+    /// `permissionMode` of the `system`/`init` event: the mode claude actually
+    /// ran in (a wrapper may override `--permission-mode`). None when absent.
+    pub permission_mode: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -182,6 +185,51 @@ fn excerpt(s: &str) -> String {
     }
 }
 
+/// The flag an account-rotating wrapper may inject; it voids every
+/// permission mode dreamd asks for.
+const BYPASS_FLAG: &str = "--dangerously-skip-permissions";
+
+fn is_executable(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Resolve `bin` the way a shell would: a name containing `/` is a path,
+/// otherwise search `$PATH`.
+pub fn resolve_bin(bin: &str) -> Option<PathBuf> {
+    if bin.contains('/') {
+        let p = PathBuf::from(bin);
+        return is_executable(&p).then_some(p);
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(bin))
+        .find(|p| is_executable(p))
+}
+
+/// When `bin` (resolved via `$PATH`) is a text script (`#!`) whose contents
+/// mention `--dangerously-skip-permissions`, its path; else None. Real
+/// binaries are never flagged.
+pub fn detect_bypass_wrapper(bin: &str) -> Option<PathBuf> {
+    let path = resolve_bin(bin)?;
+    let data = std::fs::read(&path).ok()?;
+    if !data.starts_with(b"#!") {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&data);
+    text.contains(BYPASS_FLAG).then_some(path)
+}
+
+/// The error for a `claude_bin` that injects the bypass flag.
+pub fn bypass_wrapper_error(path: &std::path::Path) -> String {
+    format!(
+        "claude_bin {} is a wrapper that injects {BYPASS_FLAG}; set claude_bin in ~/.config/dreamd/config.toml (or DREAMD_CLAUDE_BIN) to the real binary",
+        path.display()
+    )
+}
+
 /// Parse `claude -p --output-format json` stdout: a JSON array of events
 /// whose last `type == "result"` element carries the outcome.
 pub fn parse_output(stdout: &str) -> Result<ClaudeResult, ClaudeError> {
@@ -232,11 +280,21 @@ pub fn parse_output(stdout: &str) -> Result<ClaudeResult, ClaudeError> {
             .and_then(Value::as_f64)
             .unwrap_or(0.0),
     };
+    let permission_mode = events
+        .iter()
+        .find(|e| {
+            e.get("type").and_then(Value::as_str) == Some("system")
+                && e.get("subtype").and_then(Value::as_str) == Some("init")
+        })
+        .and_then(|e| e.get("permissionMode"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     Ok(ClaudeResult {
         text,
         structured,
         is_error,
         usage,
+        permission_mode,
         duration_ms: r.get("duration_ms").and_then(Value::as_u64).unwrap_or(0),
         session_id: r
             .get("session_id")
@@ -373,5 +431,47 @@ mod tests {
         assert!(matches!(c.run(req).await, Err(ClaudeError::Timeout(_))));
         tokio::time::sleep(Duration::from_millis(2500)).await;
         assert!(!marker.exists(), "child kept running after timeout");
+    }
+
+    #[test]
+    fn parse_output_reads_init_permission_mode() {
+        let out = json!([
+            {"type": "system", "subtype": "init", "session_id": "s", "permissionMode": "acceptEdits"},
+            {"type": "result", "is_error": false, "result": "ok"}
+        ])
+        .to_string();
+        assert_eq!(
+            parse_output(&out).unwrap().permission_mode.as_deref(),
+            Some("acceptEdits")
+        );
+        let none = events(json!({"type": "result", "is_error": false, "result": "ok"}));
+        assert_eq!(parse_output(&none).unwrap().permission_mode, None);
+    }
+
+    #[test]
+    fn detect_bypass_wrapper_flags_only_scripts_with_the_flag() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::TempDir::new().unwrap();
+        let mk = |name: &str, body: &str| {
+            let p = t.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let wrapper = mk(
+            "wrapper",
+            "#!/bin/sh\nexec /real/claude --dangerously-skip-permissions \"$@\"\n",
+        );
+        let plain = mk("plain", "#!/bin/sh\nexec /real/claude \"$@\"\n");
+        let binary = mk("binary", "\x7fELF --dangerously-skip-permissions");
+        let w = wrapper.to_str().unwrap();
+        assert_eq!(detect_bypass_wrapper(w), Some(wrapper.clone()));
+        assert_eq!(detect_bypass_wrapper(plain.to_str().unwrap()), None);
+        assert_eq!(detect_bypass_wrapper(binary.to_str().unwrap()), None);
+        assert_eq!(detect_bypass_wrapper("/nonexistent/claude"), None);
+        assert!(bypass_wrapper_error(&wrapper).contains("is a wrapper that injects"));
+        // The test stub must never trip the check.
+        let stub = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/stub-claude.sh");
+        assert_eq!(detect_bypass_wrapper(stub), None);
     }
 }

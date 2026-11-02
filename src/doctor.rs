@@ -17,31 +17,14 @@ pub struct Check {
 pub fn run(cfg: &Config) -> Vec<Check> {
     vec![
         check_claude(&cfg.claude_bin),
+        check_permissions(&cfg.claude_bin),
         check_config_dirs(&cfg.config_dirs),
         check_data_dir(&cfg.data_dir),
         check_database(&cfg.db_path()),
     ]
 }
 
-fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-/// Resolve `bin` the way a shell would: a name containing `/` is a path,
-/// otherwise search `$PATH`.
-pub fn resolve_bin(bin: &str) -> Option<PathBuf> {
-    if bin.contains('/') {
-        let p = PathBuf::from(bin);
-        return is_executable(&p).then_some(p);
-    }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join(bin))
-        .find(|p| is_executable(p))
-}
+pub use crate::claude::resolve_bin;
 
 fn check_claude(bin: &str) -> Check {
     match resolve_bin(bin) {
@@ -54,6 +37,22 @@ fn check_claude(bin: &str) -> Check {
             name: "claude binary",
             ok: false,
             detail: format!("`{bin}` not found or not executable"),
+        },
+    }
+}
+
+/// FAIL when `claude_bin` is a wrapper that injects the bypass flag.
+fn check_permissions(bin: &str) -> Check {
+    match crate::claude::detect_bypass_wrapper(bin) {
+        Some(p) => Check {
+            name: "claude permissions",
+            ok: false,
+            detail: crate::claude::bypass_wrapper_error(&p),
+        },
+        None => Check {
+            name: "claude permissions",
+            ok: true,
+            detail: "permission modes are honoured (no bypass wrapper)".into(),
         },
     }
 }
@@ -112,7 +111,7 @@ pub fn render(checks: &[Check]) -> String {
         .iter()
         .map(|c| {
             format!(
-                "{:<4} {:<13} {}\n",
+                "{:<4} {:<18} {}\n",
                 if c.ok { "ok" } else { "FAIL" },
                 c.name,
                 c.detail

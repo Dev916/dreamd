@@ -188,3 +188,295 @@ fn cancel_refuses_terminal_dream() {
         .code(3)
         .stderr(predicate::str::contains("refused: dream is completed"));
 }
+
+#[test]
+fn aggregator_argv_is_contained() {
+    let f = common::fixture();
+    let argv_out = f.root.path().join("argv.txt");
+    dream(&f)
+        .arg("--force")
+        .env("DREAMD_STUB_ARGV_OUT", &argv_out)
+        .assert()
+        .code(0);
+    let all = std::fs::read_to_string(&argv_out).unwrap();
+    // Prompts span lines and calls run concurrently, so scan flag/value pairs:
+    // workers run in plan mode, the single aggregator in acceptEdits.
+    let lines: Vec<&str> = all.lines().collect();
+    let modes: Vec<&str> = lines
+        .windows(2)
+        .filter(|w| w[0] == "--permission-mode")
+        .map(|w| w[1])
+        .collect();
+    assert_eq!(
+        modes.iter().filter(|m| **m == "acceptEdits").count(),
+        1,
+        "{modes:?}"
+    );
+    assert_eq!(
+        modes.iter().filter(|m| **m == "plan").count(),
+        3,
+        "{modes:?}"
+    );
+    assert_eq!(modes.len(), 4, "{modes:?}");
+    let tools: Vec<&str> = lines
+        .windows(2)
+        .filter(|w| w[0] == "--allowedTools")
+        .map(|w| w[1])
+        .collect();
+    assert_eq!(
+        tools,
+        vec!["Read,Glob,Grep,Write(./**),Edit(./**)"],
+        "{all}"
+    );
+    assert!(!all.contains("bypassPermissions"), "{all}");
+    assert!(!all.contains("Bash("), "{all}");
+    assert!(!lines.contains(&"--add-dir"), "{all}");
+}
+
+#[test]
+fn delete_manifest_removes_listed_file() {
+    let f = common::fixture();
+    let out = dream(&f)
+        .arg("--force")
+        .env("DREAMD_STUB_DELETE", "1")
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("+1 -1 ~1 files"), "{stdout}");
+    let dir = only_dream_dir(&f);
+    assert!(!dir.join("out/fact-b.md").exists(), "fact-b.md deleted");
+    assert!(!dir.join("out/.dreamd-delete").exists(), "manifest removed");
+    assert!(f.memory_dir.join("fact-b.md").is_file(), "live untouched");
+    let diff = std::fs::read_to_string(dir.join("dream.diff")).unwrap();
+    assert!(diff.contains("--- a/fact-b.md"), "{diff}");
+    assert!(!diff.contains(".dreamd-delete"), "{diff}");
+}
+
+#[test]
+fn bad_delete_entry_fails_the_dream() {
+    let f = common::fixture();
+    // Reuse the stub's escape hook to write a bogus manifest line
+    // (`escaped write`) into out/.dreamd-delete.
+    dream(&f)
+        .arg("--force")
+        .env("DREAMD_STUB_ESCAPE", ".dreamd-delete")
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("bad delete entry: escaped write"));
+}
+
+#[test]
+fn live_memory_change_during_aggregation_fails_the_dream() {
+    let f = common::fixture();
+    let live = f.memory_dir.join("fact-a.md");
+    dream(&f)
+        .arg("--force")
+        .env("DREAMD_STUB_TOUCH_LIVE", &live)
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains(
+            "live memory dir changed during aggregation",
+        ));
+    let id = only_dream_dir(&f)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    common::cmd(&f)
+        .args(["show", &id])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("failed"))
+        .stdout(predicate::str::contains(
+            "live memory dir changed during aggregation",
+        ));
+}
+
+/// Point the fixture project's transcripts (and so its discovered cwd) at `proj`.
+fn retarget_cwd(f: &common::Fixture, proj: &Path) {
+    for t in f.transcripts() {
+        let text = std::fs::read_to_string(&t).unwrap();
+        let text = text.replace(
+            "\"/tmp/proj\"",
+            &format!("{:?}", proj.display().to_string()),
+        );
+        std::fs::write(&t, text).unwrap();
+        common::set_aged(&t);
+    }
+}
+
+#[test]
+fn project_claude_md_is_copied_to_context() {
+    let f = common::fixture();
+    let proj = f.root.path().join("proj");
+    std::fs::create_dir_all(proj.join(".claude")).unwrap();
+    std::fs::write(proj.join(".claude/CLAUDE.md"), "house rules\n").unwrap();
+    std::fs::write(proj.join("AGENTS.md"), "agents\n").unwrap();
+    retarget_cwd(&f, &proj);
+    let prompt_out = f.root.path().join("prompt.txt");
+    dream(&f)
+        .arg("--force")
+        .env("DREAMD_STUB_PROMPT_OUT", &prompt_out)
+        .assert()
+        .code(0);
+    let dir = only_dream_dir(&f);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("context/CLAUDE.md")).unwrap(),
+        "house rules\n"
+    );
+    assert!(dir.join("context/AGENTS.md").is_file());
+    let p = std::fs::read_to_string(&prompt_out).unwrap();
+    assert!(p.contains("../context/CLAUDE.md"), "{p}");
+    assert!(p.contains("../context/AGENTS.md"), "{p}");
+    assert!(!p.contains(&proj.display().to_string()), "{p}");
+}
+
+#[test]
+fn no_claude_md_prompt_skips_reconcile() {
+    let f = common::fixture();
+    let proj = f.root.path().join("bare-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    retarget_cwd(&f, &proj);
+    let prompt_out = f.root.path().join("prompt.txt");
+    dream(&f)
+        .arg("--force")
+        .env("DREAMD_STUB_PROMPT_OUT", &prompt_out)
+        .assert()
+        .code(0);
+    let p = std::fs::read_to_string(&prompt_out).unwrap();
+    assert!(p.contains("no CLAUDE.md"), "{p}");
+    assert!(!p.contains("../context/CLAUDE.md"), "{p}");
+    assert!(!only_dream_dir(&f).join("context").exists());
+}
+
+fn failed_dream_show(f: &common::Fixture) -> String {
+    let id = only_dream_dir(f)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let out = common::cmd(f)
+        .args(["show", &id])
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(out).unwrap()
+}
+
+#[test]
+fn aggregator_in_bypass_mode_fails_the_dream() {
+    let f = common::fixture();
+    dream(&f)
+        .arg("--force")
+        .env("DREAMD_STUB_PERMISSION_MODE", "bypassPermissions")
+        .env("DREAMD_STUB_PERMISSION_MODE_FOR", "aggregator")
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains(
+            "aggregator ran with permission mode bypassPermissions, expected acceptEdits (is claude_bin a wrapper that adds --dangerously-skip-permissions?)",
+        ));
+    let show = failed_dream_show(&f);
+    assert!(show.contains("failed"), "{show}");
+    assert!(
+        show.contains("aggregator ran with permission mode"),
+        "{show}"
+    );
+}
+
+#[test]
+fn workers_in_bypass_mode_are_failed() {
+    let f = common::fixture();
+    dream(&f)
+        .arg("--force")
+        .env("DREAMD_STUB_PERMISSION_MODE", "bypassPermissions")
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("all workers failed"));
+    let show = failed_dream_show(&f);
+    assert_eq!(
+        show.matches("worker ran with permission mode bypassPermissions, expected plan")
+            .count(),
+        3,
+        "{show}"
+    );
+}
+
+/// An executable script in the fixture root that execs the stub and
+/// mentions the bypass flag, like the account-rotating wrapper does.
+fn bypass_wrapper(f: &common::Fixture) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = f.root.path().join("claude-wrapper");
+    let stub = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/stub-claude.sh");
+    std::fs::write(
+        &p,
+        format!(
+            "#!/bin/sh\n# would add --dangerously-skip-permissions\nexec {} \"$@\"\n",
+            stub.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+#[test]
+fn bypass_wrapper_claude_bin_is_refused() {
+    let f = common::fixture();
+    let w = bypass_wrapper(&f);
+    dream(&f)
+        .arg("--force")
+        .env("DREAMD_CLAUDE_BIN", &w)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "claude_bin {} is a wrapper that injects --dangerously-skip-permissions; set claude_bin in ~/.config/dreamd/config.toml (or DREAMD_CLAUDE_BIN) to the real binary",
+            w.display()
+        )));
+    assert!(!f.data_dir.join("dreams").exists(), "no dream created");
+    // Explicit opt-out.
+    dream(&f)
+        .arg("--force")
+        .env("DREAMD_CLAUDE_BIN", &w)
+        .env("DREAMD_ALLOW_BYPASS_WRAPPER", "1")
+        .assert()
+        .code(0);
+}
+
+#[test]
+fn doctor_flags_bypass_wrapper() {
+    let f = common::fixture();
+    let w = bypass_wrapper(&f);
+    let out = common::cmd(&f)
+        .env("DREAMD_CLAUDE_BIN", &w)
+        .arg("doctor")
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("claude permissions"))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(line.starts_with("FAIL"), "{line}");
+    assert!(line.contains("is a wrapper that injects"), "{line}");
+    let ok = common::cmd(&f)
+        .arg("doctor")
+        .assert()
+        .get_output()
+        .stdout
+        .clone();
+    let ok = String::from_utf8(ok).unwrap();
+    let line = ok
+        .lines()
+        .find(|l| l.contains("claude permissions"))
+        .unwrap();
+    assert!(line.starts_with("ok"), "{line}");
+}

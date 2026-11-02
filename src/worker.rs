@@ -18,6 +18,9 @@ use crate::transcript::Digest;
 /// worker itself (the runner normally times out and kills claude first).
 const TIMEOUT_GRACE: Duration = Duration::from_secs(2);
 
+/// Workers need no tools: the digest is inlined in the prompt.
+pub const WORKER_PERMISSION_MODE: &str = "plan";
+
 /// The worker prompt for one session digest.
 pub fn worker_prompt(memory_index: &str, digest: &Digest) -> String {
     let index = if memory_index.trim().is_empty() {
@@ -88,7 +91,7 @@ pub async fn mine_sessions(
             &cfg.effort,
             timeout,
         );
-        req.permission_mode = Some("plan".into());
+        req.permission_mode = Some(WORKER_PERMISSION_MODE.into());
         req.json_schema = Some(schema.clone());
         let claude = Arc::clone(&claude);
         let sem = Arc::clone(&sem);
@@ -163,6 +166,15 @@ fn finish(
         o.record.usage = r.usage;
         o
     };
+    if let Some(mode) = r
+        .permission_mode
+        .as_deref()
+        .filter(|m| *m != WORKER_PERMISSION_MODE)
+    {
+        return fail_with_usage(format!(
+            "worker ran with permission mode {mode}, expected {WORKER_PERMISSION_MODE} (is claude_bin a wrapper that adds --dangerously-skip-permissions?)"
+        ));
+    }
     let Some(value) = r.structured.clone() else {
         return fail_with_usage("worker returned no structured output".into());
     };
@@ -265,6 +277,7 @@ mod tests {
                     },
                     duration_ms: 1,
                     session_id: "x".into(),
+                    permission_mode: None,
                 })
             };
             match sid.as_str() {

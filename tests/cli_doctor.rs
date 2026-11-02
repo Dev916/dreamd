@@ -32,7 +32,13 @@ fn doctor_all_ok() {
     let tmp = TempDir::new().unwrap();
     let out = dreamd(&tmp).arg("doctor").assert().success();
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
-    for name in ["claude binary", "config dirs", "data dir", "database"] {
+    for name in [
+        "claude binary",
+        "claude permissions",
+        "config dirs",
+        "data dir",
+        "database",
+    ] {
         let line = stdout
             .lines()
             .find(|l| l.contains(name))
@@ -81,7 +87,7 @@ fn doctor_json_output() {
     let out = dreamd(&tmp).args(["doctor", "--json"]).assert().success();
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     let arr = v.as_array().unwrap();
-    assert_eq!(arr.len(), 4);
+    assert_eq!(arr.len(), 5);
     assert!(arr.iter().all(|c| c["ok"] == true));
 }
 

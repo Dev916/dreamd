@@ -5,7 +5,8 @@
 //! Dream dir layout (`<data_dir>/dreams/<id>/`): `in/` (snapshot),
 //! `in.sha256` (hash of `in/`), `out/` (the clone the aggregator edits,
 //! stored as `Dream::output_dir`), `findings/<session>.json`,
-//! `aggregate.md`, `dream.diff`.
+//! `context/` (read-only copies of the project's CLAUDE.md / AGENTS.md for
+//! the aggregator), `aggregate.md`, `dream.diff`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,7 +14,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use chrono::Utc;
 
-use crate::aggregate::{aggregator_prompt, extract_summary, run_aggregator};
+use crate::aggregate::{
+    aggregator_prompt, extract_summary, run_aggregator, AGGREGATOR_PERMISSION_MODE,
+};
 use crate::claude::{Claude, CliClaude};
 use crate::config::Config;
 use crate::db::Db;
@@ -21,7 +24,7 @@ use crate::discover::{candidate_sessions, gate, DiscoveredProject, Gate};
 use crate::fsops::{copy_dir, hash_dir, unified_diff};
 use crate::model::{Dream, DreamStatus, SessionFile, SessionRecord, SessionStatus, Usage};
 use crate::notify::notify;
-use crate::postcheck::{check, check_escapes, snapshot_mtimes};
+use crate::postcheck::{apply_delete_manifest, check, check_escapes, snapshot_mtimes};
 use crate::{transcript, worker};
 
 /// Shared state for the CLI and the API server.
@@ -40,8 +43,15 @@ impl Ctx {
         Ctx::new(cfg)
     }
 
-    /// `from_env` with an already-loaded config.
+    /// `from_env` with an already-loaded config. Refuses a `claude_bin` that
+    /// is a wrapper injecting `--dangerously-skip-permissions` unless
+    /// `DREAMD_ALLOW_BYPASS_WRAPPER=1`.
     pub fn new(cfg: Config) -> anyhow::Result<Ctx> {
+        if std::env::var("DREAMD_ALLOW_BYPASS_WRAPPER").as_deref() != Ok("1") {
+            if let Some(p) = crate::claude::detect_bypass_wrapper(&cfg.claude_bin) {
+                anyhow::bail!(crate::claude::bypass_wrapper_error(&p));
+            }
+        }
         let db = Arc::new(Db::open(&cfg.db_path())?);
         let claude: Arc<dyn Claude> = Arc::new(CliClaude {
             bin: cfg.claude_bin.clone(),
@@ -308,34 +318,55 @@ async fn pipeline(
         return Ok(Stop::Canceled);
     }
 
-    // 4. Aggregate. The "before" snapshot is taken after findings exist.
+    // 4. Aggregate. Project context is copied into the dream dir first (the
+    //    aggregator gets no access to the project tree), then the "before"
+    //    snapshot is taken (findings and context exist by then) and the live
+    //    memory dir is hashed.
+    let cwd = dream.project.cwd.as_deref().filter(|p| p.is_dir());
+    let context_files = copy_context(cwd, &dir.join("context")).context("copy project context")?;
     let before = snapshot_mtimes(dir);
+    let live_before = hash_dir(memory_dir).context("hash live memory dir")?;
     let findings: Vec<PathBuf> = outcomes
         .iter()
         .filter_map(|o| o.record.findings_path.clone())
         .collect();
-    let cwd = dream.project.cwd.as_deref().filter(|p| p.is_dir());
-    let claude_md = cwd.map(|c| c.join("CLAUDE.md")).filter(|p| p.is_file());
     let prompt = aggregator_prompt(
         &dream.project,
-        claude_md.as_deref(),
+        &context_files,
         &findings,
         opts.instructions.as_deref(),
     );
     let mut agg_cfg = ctx.cfg.aggregator.clone();
     agg_cfg.model = model.to_string();
-    let result = run_aggregator(ctx.claude.as_ref(), &agg_cfg, &out_dir, prompt, cwd)
+    let result = run_aggregator(ctx.claude.as_ref(), &agg_cfg, &out_dir, prompt)
         .await
         .map_err(|e| anyhow::anyhow!("aggregator: {e}"))?;
     *usage += result.usage;
+    if let Some(mode) = result
+        .permission_mode
+        .as_deref()
+        .filter(|m| *m != AGGREGATOR_PERMISSION_MODE)
+    {
+        anyhow::bail!(
+            "aggregator ran with permission mode {mode}, expected {AGGREGATOR_PERMISSION_MODE} (is claude_bin a wrapper that adds --dangerously-skip-permissions?)"
+        );
+    }
     if canceled(ctx, id)? {
         return Ok(Stop::Canceled);
     }
 
-    // 5. Post-check, then write artifacts (after check_escapes, so they do
-    //    not register as escapes).
+    // 5. Post-check (fail closed), then write artifacts (after check_escapes,
+    //    so they do not register as escapes).
+    let live_after = hash_dir(memory_dir).context("re-hash live memory dir")?;
+    if live_after != live_before {
+        anyhow::bail!(
+            "live memory dir changed during aggregation: {}",
+            memory_dir.display()
+        );
+    }
     let after = snapshot_mtimes(dir);
     let mut violations = check_escapes(dir, &before, &after);
+    violations.extend(apply_delete_manifest(&out_dir));
     violations.extend(check(&in_dir, &out_dir));
     if !violations.is_empty() {
         let list: Vec<String> = violations.iter().map(|v| v.to_string()).collect();
@@ -357,6 +388,32 @@ async fn pipeline(
     Ok(Stop::Completed)
 }
 
+/// Copy the project's CLAUDE.md (`<cwd>/CLAUDE.md`, else
+/// `<cwd>/.claude/CLAUDE.md`) and `<cwd>/AGENTS.md` into `context_dir`;
+/// returns the names copied (`CLAUDE.md` first). Symlinks are followed only
+/// when they resolve to a regular file.
+pub fn copy_context(cwd: Option<&Path>, context_dir: &Path) -> std::io::Result<Vec<&'static str>> {
+    let Some(cwd) = cwd else {
+        return Ok(Vec::new());
+    };
+    let sources: [(&'static str, Vec<PathBuf>); 2] = [
+        (
+            "CLAUDE.md",
+            vec![cwd.join("CLAUDE.md"), cwd.join(".claude").join("CLAUDE.md")],
+        ),
+        ("AGENTS.md", vec![cwd.join("AGENTS.md")]),
+    ];
+    let mut copied = Vec::new();
+    for (name, candidates) in sources {
+        if let Some(src) = candidates.into_iter().find(|p| p.is_file()) {
+            std::fs::create_dir_all(context_dir)?;
+            std::fs::copy(&src, context_dir.join(name))?;
+            copied.push(name);
+        }
+    }
+    Ok(copied)
+}
+
 fn pending_record(sid: &str, path: &Path) -> SessionRecord {
     SessionRecord {
         session_id: sid.to_string(),
@@ -376,4 +433,43 @@ pub fn sessions_mined(db: &Db, id: &str) -> anyhow::Result<usize> {
         .iter()
         .filter(|s| s.status == SessionStatus::Ok)
         .count())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_context_prefers_root_claude_md_then_dot_claude() {
+        let t = tempfile::TempDir::new().unwrap();
+        let cwd = t.path().join("proj");
+        std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+        std::fs::write(cwd.join(".claude/CLAUDE.md"), "dot\n").unwrap();
+        let ctx = t.path().join("d/context");
+        assert_eq!(copy_context(Some(&cwd), &ctx).unwrap(), vec!["CLAUDE.md"]);
+        assert_eq!(
+            std::fs::read_to_string(ctx.join("CLAUDE.md")).unwrap(),
+            "dot\n"
+        );
+        std::fs::write(cwd.join("CLAUDE.md"), "root\n").unwrap();
+        std::fs::write(cwd.join("AGENTS.md"), "agents\n").unwrap();
+        assert_eq!(
+            copy_context(Some(&cwd), &ctx).unwrap(),
+            vec!["CLAUDE.md", "AGENTS.md"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(ctx.join("CLAUDE.md")).unwrap(),
+            "root\n"
+        );
+        assert!(ctx.join("AGENTS.md").is_file());
+    }
+
+    #[test]
+    fn copy_context_without_files_creates_nothing() {
+        let t = tempfile::TempDir::new().unwrap();
+        let ctx = t.path().join("context");
+        assert!(copy_context(Some(t.path()), &ctx).unwrap().is_empty());
+        assert!(copy_context(None, &ctx).unwrap().is_empty());
+        assert!(!ctx.exists());
+    }
 }

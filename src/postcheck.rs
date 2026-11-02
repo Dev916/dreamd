@@ -16,6 +16,8 @@ pub enum Violation {
     BrokenIndexLink { target: String },
     /// A file outside `out/` under the dream dir was created, modified or removed.
     EscapedWrite(PathBuf),
+    /// A `.dreamd-delete` line that is not a bare, existing, non-index `*.md` in `out/`.
+    BadDeleteEntry(String),
 }
 
 impl fmt::Display for Violation {
@@ -26,8 +28,77 @@ impl fmt::Display for Violation {
                 write!(f, "MEMORY.md links to missing file: {target}")
             }
             Violation::EscapedWrite(p) => write!(f, "write outside out/: {}", p.display()),
+            Violation::BadDeleteEntry(e) => write!(f, "bad delete entry: {e}"),
         }
     }
+}
+
+/// The deletion manifest the aggregator writes in `out/` (it has no shell):
+/// one bare memory filename per line.
+pub const DELETE_MANIFEST: &str = ".dreamd-delete";
+
+/// True when `name` may be deleted from `out_dir`: a plain `*.md` filename
+/// (no path separators, not `..`, not `MEMORY.md`) naming an existing
+/// regular file (symlinks are not followed).
+fn deletable(out_dir: &Path, name: &str) -> bool {
+    !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+        && name != ".."
+        && name != "."
+        && name != "MEMORY.md"
+        && name.ends_with(".md")
+        && name.len() > ".md".len()
+        && out_dir
+            .join(name)
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_file())
+}
+
+/// Apply and remove `out_dir/.dreamd-delete`. Valid entries are deleted;
+/// every invalid one becomes a `BadDeleteEntry` (in manifest order). Blank
+/// lines are ignored; a missing manifest is a no-op. The manifest file is
+/// always removed so it never reaches the diff.
+pub fn apply_delete_manifest(out_dir: &Path) -> Vec<Violation> {
+    let path = out_dir.join(DELETE_MANIFEST);
+    let Ok(md) = path.symlink_metadata() else {
+        return Vec::new();
+    };
+    let text = if md.file_type().is_file() {
+        String::from_utf8_lossy(&fs::read(&path).unwrap_or_default()).into_owned()
+    } else {
+        String::new()
+    };
+    let mut bad = Vec::new();
+    if !md.file_type().is_file() {
+        bad.push(Violation::BadDeleteEntry(format!(
+            "{DELETE_MANIFEST} is not a regular file"
+        )));
+    }
+    for line in text.lines() {
+        let name = line.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if deletable(out_dir, name) {
+            if let Err(e) = fs::remove_file(out_dir.join(name)) {
+                bad.push(Violation::BadDeleteEntry(format!("{name} ({e})")));
+            }
+        } else {
+            bad.push(Violation::BadDeleteEntry(name.to_string()));
+        }
+    }
+    let removed = if md.file_type().is_dir() {
+        fs::remove_dir_all(&path)
+    } else {
+        fs::remove_file(&path)
+    };
+    if let Err(e) = removed {
+        bad.push(Violation::BadDeleteEntry(format!(
+            "could not remove {DELETE_MANIFEST}: {e}"
+        )));
+    }
+    bad
 }
 
 /// True when `text` starts with `---\n` and has `name:` and `description:`
@@ -255,5 +326,55 @@ mod tests {
             ]
         );
         assert!(v[1].to_string().starts_with("write outside out/: "));
+    }
+
+    fn manifest_dir(entries: &str) -> (tempfile::TempDir, PathBuf) {
+        let t = tempfile::TempDir::new().unwrap();
+        let o = t.path().join("out");
+        write(&o.join("MEMORY.md"), "- [A](a.md) — a\n");
+        write(&o.join("a.md"), GOOD);
+        write(&o.join("b.md"), GOOD);
+        write(&t.path().join("x.md"), GOOD);
+        write(&o.join(DELETE_MANIFEST), entries);
+        (t, o)
+    }
+
+    #[test]
+    fn delete_manifest_removes_valid_entries() {
+        let (_t, o) = manifest_dir("b.md\n\n  \n");
+        assert_eq!(apply_delete_manifest(&o), vec![]);
+        assert!(!o.join("b.md").exists());
+        assert!(o.join("a.md").is_file());
+        assert!(!o.join(DELETE_MANIFEST).exists(), "manifest removed");
+    }
+
+    #[test]
+    fn delete_manifest_absent_is_noop() {
+        let t = tempfile::TempDir::new().unwrap();
+        write(&t.path().join("a.md"), GOOD);
+        assert_eq!(apply_delete_manifest(t.path()), vec![]);
+        assert!(t.path().join("a.md").is_file());
+    }
+
+    #[test]
+    fn delete_manifest_rejects_traversal_index_and_missing() {
+        let (t, o) = manifest_dir("../x.md\na/b.md\nMEMORY.md\nnope.md\nb.md\nnotes.txt\n..\n");
+        let v = apply_delete_manifest(&o);
+        assert_eq!(
+            v,
+            vec![
+                Violation::BadDeleteEntry("../x.md".into()),
+                Violation::BadDeleteEntry("a/b.md".into()),
+                Violation::BadDeleteEntry("MEMORY.md".into()),
+                Violation::BadDeleteEntry("nope.md".into()),
+                Violation::BadDeleteEntry("notes.txt".into()),
+                Violation::BadDeleteEntry("..".into()),
+            ]
+        );
+        assert_eq!(v[0].to_string(), "bad delete entry: ../x.md");
+        assert!(t.path().join("x.md").is_file(), "traversal target kept");
+        assert!(o.join("MEMORY.md").is_file());
+        assert!(!o.join("b.md").exists(), "valid entry still applied");
+        assert!(!o.join(DELETE_MANIFEST).exists());
     }
 }

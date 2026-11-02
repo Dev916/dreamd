@@ -88,6 +88,11 @@ pub fn fixture() -> Fixture {
     }
 }
 
+/// Set a file's mtime to now - 2h (an aged, dreamable transcript).
+pub fn set_aged(path: &Path) {
+    set_mtime(path, SystemTime::now() - Duration::from_secs(2 * 3600));
+}
+
 /// Set a file's mtime to now (makes a transcript "live").
 pub fn touch_recent(path: &Path) {
     set_mtime(path, SystemTime::now());
