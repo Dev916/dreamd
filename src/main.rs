@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod db;
+mod discover;
 mod doctor;
 mod model;
 
@@ -91,6 +92,31 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 println!("{}", serde_json::to_string_pretty(&d)?);
             } else {
                 print!("{}", render_dream(&d));
+            }
+            Ok(EXIT_OK)
+        }
+        Command::Scan { all_dirs } => {
+            let db = Db::open(&cfg.db_path())?;
+            let found = discover::discover(&cfg, &db, chrono::Utc::now())?;
+            let rows: Vec<discover::ScanRow> = found
+                .iter()
+                .map(|d| discover::ScanRow::new(d, &cfg))
+                .collect();
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+                return Ok(EXIT_OK);
+            }
+            if all_dirs {
+                for dir in &cfg.config_dirs {
+                    let n = rows.iter().filter(|r| &r.config_dir == dir).count();
+                    println!("# {}: {n} dreamable project(s)", dir.display());
+                }
+            }
+            if rows.is_empty() {
+                println!("no dreamable projects");
+            }
+            for r in &rows {
+                println!("{}", r.render());
             }
             Ok(EXIT_OK)
         }
