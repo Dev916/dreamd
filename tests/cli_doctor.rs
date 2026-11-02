@@ -13,7 +13,9 @@ fn dreamd(tmp: &TempDir) -> Command {
     cmd.env("DREAMD_CONFIG", tmp.path().join("no-such-config.toml"))
         .env("DREAMD_DATA_DIR", tmp.path().join("data"))
         .env("DREAMD_CONFIG_DIRS", &cfg_dir)
-        .env("DREAMD_CLAUDE_BIN", "/bin/sh");
+        .env("DREAMD_CLAUDE_BIN", "/bin/sh")
+        // `launchd schedule` reads $HOME/Library/LaunchAgents.
+        .env("HOME", tmp.path());
     cmd
 }
 
@@ -39,6 +41,8 @@ fn doctor_all_ok() {
         "data dir",
         "database",
         "api token",
+        "launchd schedule",
+        "last dream",
     ] {
         let line = stdout
             .lines()
@@ -88,7 +92,7 @@ fn doctor_json_output() {
     let out = dreamd(&tmp).args(["doctor", "--json"]).assert().success();
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     let arr = v.as_array().unwrap();
-    assert_eq!(arr.len(), 6);
+    assert_eq!(arr.len(), 8);
     assert!(arr.iter().all(|c| c["ok"] == true));
 }
 
@@ -110,4 +114,25 @@ fn config_show_reflects_env() {
     assert_eq!(v["min_hours"].as_integer(), Some(24));
     assert_eq!(v["worker"]["model"].as_str(), Some("sonnet"));
     assert_eq!(v["schedule"]["minute"].as_integer(), Some(30));
+}
+
+#[test]
+fn doctor_flags_schedule_pointing_at_missing_binary() {
+    let tmp = TempDir::new().unwrap();
+    let agents = tmp.path().join("Library/LaunchAgents");
+    std::fs::create_dir_all(&agents).unwrap();
+    let xml = dreamd::schedule::plist_xml(
+        std::path::Path::new("/nonexistent/dreamd"),
+        &dreamd::config::ScheduleCfg::default(),
+        &tmp.path().join("logs"),
+    );
+    std::fs::write(agents.join("dev.dreamd.nightly.plist"), xml).unwrap();
+    let out = dreamd(&tmp).arg("doctor").assert().code(1);
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("launchd schedule"))
+        .unwrap();
+    assert!(line.starts_with("FAIL"), "{line}");
+    assert!(line.contains("/nonexistent/dreamd"), "{line}");
 }

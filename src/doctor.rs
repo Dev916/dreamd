@@ -22,6 +22,8 @@ pub fn run(cfg: &Config) -> Vec<Check> {
         check_data_dir(&cfg.data_dir),
         check_database(&cfg.db_path()),
         check_api_token(&cfg.data_dir),
+        check_schedule(),
+        check_last_dream(&cfg.db_path()),
     ]
 }
 
@@ -132,6 +134,98 @@ fn check_api_token(data_dir: &Path) -> Check {
     }
 }
 
+/// ok when the nightly job is not installed (informational) or installed
+/// with a program that still exists; FAIL when the plist points at a binary
+/// that is gone (e.g. `cargo install` moved, or it was installed from
+/// `target/debug`) or cannot be read.
+fn check_schedule() -> Check {
+    let plist = crate::schedule::plist_path();
+    let (ok, detail) = match crate::schedule::status() {
+        Ok(st) if !st.installed => (
+            true,
+            "not installed (`dreamd schedule install` to run nightly)".to_string(),
+        ),
+        Ok(st) => {
+            let exe = std::fs::read_to_string(&plist)
+                .ok()
+                .and_then(|xml| plist_program(&xml));
+            match exe {
+                Some(exe) if Path::new(&exe).is_file() => (
+                    true,
+                    format!(
+                        "daily at {:02}:{:02} runs {exe} ({})",
+                        st.hour,
+                        st.minute,
+                        plist.display()
+                    ),
+                ),
+                Some(exe) => (
+                    false,
+                    format!(
+                        "{} runs {exe}, which does not exist; reinstall the schedule",
+                        plist.display()
+                    ),
+                ),
+                None => (
+                    false,
+                    format!("{}: no ProgramArguments found", plist.display()),
+                ),
+            }
+        }
+        Err(e) => (false, format!("{}: {e:#}", plist.display())),
+    };
+    Check {
+        name: "launchd schedule",
+        ok,
+        detail,
+    }
+}
+
+/// The first `<string>` inside `ProgramArguments` (the executable).
+fn plist_program(xml: &str) -> Option<String> {
+    let after = &xml[xml.find("<key>ProgramArguments</key>")?..];
+    let start = after.find("<string>")? + "<string>".len();
+    let end = after[start..].find("</string>")? + start;
+    Some(
+        after[start..end]
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&amp;", "&"),
+    )
+}
+
+/// Informational: the newest dream (id, status, project, when). ok unless
+/// the database cannot be read.
+fn check_last_dream(db_path: &Path) -> Check {
+    let res = crate::db::Db::open(db_path).and_then(|db| db.list_dreams(None));
+    let (ok, detail) = match res {
+        Ok(dreams) => match dreams.first() {
+            None => (true, "none yet".to_string()),
+            Some(d) => (
+                true,
+                format!(
+                    "{} {} {} ({}){}",
+                    d.id,
+                    d.status,
+                    d.project.slug,
+                    d.created_at.format("%Y-%m-%d %H:%M UTC"),
+                    d.error
+                        .as_deref()
+                        .map(|e| format!(": {e}"))
+                        .unwrap_or_default()
+                ),
+            ),
+        },
+        Err(e) => (false, format!("{}: {e:#}", db_path.display())),
+    };
+    Check {
+        name: "last dream",
+        ok,
+        detail,
+    }
+}
+
 /// Human-readable report, one line per check, prefixed `ok` or `FAIL`.
 pub fn render(checks: &[Check]) -> String {
     checks
@@ -177,6 +271,25 @@ mod tests {
         assert!(c.ok);
         assert!(c.detail.contains("missing"));
         assert!(!check_config_dirs(&[tmp.path().join("nope")]).ok);
+    }
+
+    #[test]
+    fn plist_program_reads_first_argument() {
+        let xml = crate::schedule::plist_xml(
+            Path::new("/opt/a&b/dreamd"),
+            &crate::config::ScheduleCfg::default(),
+            Path::new("/l"),
+        );
+        assert_eq!(plist_program(&xml).as_deref(), Some("/opt/a&b/dreamd"));
+        assert_eq!(plist_program("<plist/>"), None);
+    }
+
+    #[test]
+    fn last_dream_none_is_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = check_last_dream(&tmp.path().join("d.db"));
+        assert!(c.ok);
+        assert_eq!(c.detail, "none yet");
     }
 
     #[test]

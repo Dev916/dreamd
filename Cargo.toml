@@ -3,6 +3,11 @@ name = "dreamd"
 version = "0.1.0"
 edition = "2021"
 description = "Local dream machine: out-of-band consolidation of Claude Code auto-memory"
+license = "MIT"
+repository = "https://github.com/OWNER/dreamd"
+readme = "README.md"
+keywords = ["claude", "memory", "cli"]
+categories = ["command-line-utilities"]
 publish = false
 
 [[bin]]
