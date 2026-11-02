@@ -1,3 +1,4 @@
+mod claude;
 mod cli;
 mod config;
 mod db;
@@ -8,7 +9,8 @@ mod transcript;
 
 use clap::Parser;
 
-use cli::{Cli, Command, ConfigAction, EXIT_OK, EXIT_REFUSED};
+use claude::{Claude, ClaudeRequest, CliClaude};
+use cli::{Cli, Command, ConfigAction, EXIT_FAILED, EXIT_OK, EXIT_REFUSED};
 use db::Db;
 use model::Dream;
 
@@ -130,6 +132,53 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 eprintln!("skipped {} malformed line{s}", d.skipped_lines);
             }
             Ok(EXIT_OK)
+        }
+        Command::ClaudeProbe {
+            prompt,
+            model,
+            timeout,
+        } => {
+            let claude = CliClaude {
+                // config::load already applied DREAMD_CLAUDE_BIN.
+                bin: cfg.claude_bin.clone(),
+            };
+            let req = ClaudeRequest::new(
+                prompt,
+                model.as_deref().unwrap_or(&cfg.worker.model),
+                &cfg.worker.effort,
+                std::time::Duration::from_secs(timeout.unwrap_or(cfg.worker.timeout_secs)),
+            );
+            match claude.run(req).await {
+                Ok(r) => {
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "text": r.text,
+                                "structured": r.structured,
+                                "usage": r.usage,
+                                "duration_ms": r.duration_ms,
+                                "session_id": r.session_id,
+                            }))?
+                        );
+                    } else {
+                        println!("{}", r.text);
+                        println!(
+                            "usage: input_tokens={} output_tokens={} cost_usd={:.4} duration_ms={} session_id={}",
+                            r.usage.input_tokens,
+                            r.usage.output_tokens,
+                            r.usage.cost_usd,
+                            r.duration_ms,
+                            r.session_id
+                        );
+                    }
+                    Ok(EXIT_OK)
+                }
+                Err(e) => {
+                    eprintln!("claude error: {e}");
+                    Ok(EXIT_FAILED)
+                }
+            }
         }
         _ => anyhow::bail!("not implemented"),
     }

@@ -6,14 +6,12 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 pub const EXIT_OK: i32 = 0;
-// Remaining codes are returned by later commands (dream/apply/rollback).
 /// Gate-skipped / nothing to do.
 #[allow(dead_code)]
 pub const EXIT_SKIPPED: i32 = 2;
 /// Refused (hash mismatch, bad status, unknown dream).
 pub const EXIT_REFUSED: i32 = 3;
-/// Dream failed.
-#[allow(dead_code)]
+/// Dream failed (also: a `claude-probe` call failed).
 pub const EXIT_FAILED: i32 = 4;
 
 #[derive(Debug, Parser)]
@@ -111,6 +109,9 @@ pub enum Command {
         prompt: String,
         #[arg(long)]
         model: Option<String>,
+        /// Kill claude and fail after this many seconds (default: worker timeout).
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// (debug) Run the worker fan-out over transcripts into a dream dir.
     #[command(hide = true)]
