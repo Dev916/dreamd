@@ -191,7 +191,12 @@ fn sanitize(s: &str) -> String {
         }
         if i - start > BASE64_RUN {
             // All bytes in the run are ASCII, so `start`/`i` are char boundaries.
-            let cut = data_url_start(s, start).unwrap_or(start);
+            // Only swallow a data-URL prefix that lies in the not-yet-copied
+            // region; an earlier `data:` (before `copied`) would make the slice
+            // below panic on adjacent runs joined by `;base64,`.
+            let cut = data_url_start(s, start)
+                .filter(|&c| c >= copied)
+                .unwrap_or(start);
             out.push_str(&s[copied..cut]);
             out.push_str(BINARY);
             copied = i;
@@ -283,6 +288,18 @@ mod tests {
         assert!(d.text.contains("USER: see pic"));
         assert!(!d.text.contains("iVBORw0KGgo"));
         assert!(!d.text.contains("base64"));
+    }
+
+    #[test]
+    fn adjacent_base64_runs_with_base64_marker_do_not_panic() {
+        // Regression: two long runs joined by ";base64," used to make
+        // data_url_start() point before `copied`, panicking on the slice.
+        let blob = "QUJD".repeat(500);
+        let text = format!("data:image/png;base64,{blob};base64,{blob} tail");
+        let out = sanitize(&text);
+        assert_eq!(out.matches("[binary omitted]").count(), 2, "{out}");
+        assert!(out.ends_with(" tail"));
+        assert!(!out.contains(&blob[..101]));
     }
 
     #[test]
