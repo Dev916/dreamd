@@ -1,25 +1,13 @@
-mod aggregate;
-mod apply;
-mod claude;
-mod cli;
-mod config;
-mod db;
-mod discover;
-mod doctor;
-mod dream;
-mod fsops;
-mod model;
-mod notify;
-mod postcheck;
-mod transcript;
-mod worker;
+use dreamd::{
+    api, apply, cli, config, discover, doctor, dream, fsops, model, postcheck, transcript, worker,
+};
 
 use clap::Parser;
 
-use claude::{Claude, ClaudeRequest, CliClaude};
 use cli::{Cli, Command, ConfigAction, EXIT_FAILED, EXIT_OK, EXIT_REFUSED, EXIT_SKIPPED};
-use db::Db;
-use model::{Dream, DreamStatus};
+use dreamd::claude::{Claude, ClaudeRequest, CliClaude};
+use dreamd::db::Db;
+use dreamd::model::{Dream, DreamStatus};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -133,6 +121,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 instructions,
                 session_ids: (!sessions.is_empty()).then_some(sessions),
                 dry_run,
+                no_pid: false,
             };
             dream_cmd(selector.as_deref(), all, opts).await
         }
@@ -229,6 +218,12 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             timeout,
         } => mine(&cfg, &dream_dir, transcripts, timeout).await,
         Command::Postcheck { in_dir, out_dir } => postcheck_cmd(&in_dir, &out_dir),
+        Command::Serve { port } => {
+            let port = port.unwrap_or(cfg.port);
+            let ctx = dream::Ctx::new(cfg)?;
+            api::serve(ctx, port).await?;
+            Ok(EXIT_OK)
+        }
         _ => anyhow::bail!("not implemented"),
     }
 }
@@ -338,37 +333,6 @@ fn postcheck_cmd(in_dir: &std::path::Path, out_dir: &std::path::Path) -> anyhow:
     Ok(EXIT_OK)
 }
 
-/// Find the projects a `dream` selector names: a slug, or a path compared
-/// with each project's cwd. `None` selector = every project (`--all`).
-fn select_projects(
-    found: Vec<discover::DiscoveredProject>,
-    selector: Option<&str>,
-) -> Vec<discover::DiscoveredProject> {
-    let Some(sel) = selector else {
-        return found;
-    };
-    let as_path = std::path::Path::new(sel);
-    let canon = std::fs::canonicalize(as_path).ok();
-    let by_slug: Vec<_> = found
-        .iter()
-        .filter(|d| d.project.slug == sel)
-        .cloned()
-        .collect();
-    if !by_slug.is_empty() {
-        return by_slug.into_iter().take(1).collect();
-    }
-    found
-        .into_iter()
-        .filter(|d| {
-            d.project
-                .cwd
-                .as_deref()
-                .is_some_and(|c| c == as_path || canon.as_deref().is_some_and(|k| k == c))
-        })
-        .take(1)
-        .collect()
-}
-
 /// `dream <selector>|--all`: run the pipeline, print one line per project.
 async fn dream_cmd(
     selector: Option<&str>,
@@ -377,7 +341,7 @@ async fn dream_cmd(
 ) -> anyhow::Result<i32> {
     let ctx = dream::Ctx::from_env()?;
     let found = discover::discover(&ctx.cfg, &ctx.db, chrono::Utc::now())?;
-    let targets = select_projects(found, if all { None } else { selector });
+    let targets = discover::select_projects(found, if all { None } else { selector });
     if targets.is_empty() {
         if all {
             println!("no dreamable projects");

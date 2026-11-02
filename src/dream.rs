@@ -70,6 +70,9 @@ pub struct DreamOpts {
     /// Explicit sessions: bypasses the gate and restricts candidates.
     pub session_ids: Option<Vec<String>>,
     pub dry_run: bool,
+    /// Do not record this process's pid on the dream (the API server sets
+    /// this so a CLI `cancel` never signals the server).
+    pub no_pid: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -143,15 +146,26 @@ enum Stop {
     Canceled,
 }
 
-/// Run one dream end to end. Errors after the dream row exists are recorded
-/// as `failed` (output kept) and returned as `Done`; only errors before that
-/// (or database failures while recording) are `Err`.
+/// Run one dream end to end: [`prepare`] then [`execute`]. Errors after the
+/// dream row exists are recorded as `failed` (output kept) and returned as
+/// `Done`; only errors before that (or database failures while recording)
+/// are `Err`.
 pub async fn run_dream(
     ctx: &Ctx,
     d: DiscoveredProject,
     opts: DreamOpts,
 ) -> anyhow::Result<DreamOutcome> {
-    let sessions = match select_sessions(ctx, &d, &opts) {
+    match prepare(ctx, &d, &opts)? {
+        DreamOutcome::Done(dream) => Ok(DreamOutcome::Done(execute(ctx, dream, opts).await?)),
+        skipped => Ok(skipped),
+    }
+}
+
+/// Gate, select sessions and insert the `Pending` dream row. `Skipped` when
+/// the gate says no, no sessions qualify, or `opts.dry_run` (which prints
+/// the plan). Fast and synchronous, so the API can answer 202 with the row.
+pub fn prepare(ctx: &Ctx, d: &DiscoveredProject, opts: &DreamOpts) -> anyhow::Result<DreamOutcome> {
+    let sessions = match select_sessions(ctx, d, opts) {
         Ok(s) => s,
         Err(why) => return Ok(DreamOutcome::Skipped(why)),
     };
@@ -183,10 +197,10 @@ pub async fn run_dream(
         .clone()
         .unwrap_or_else(|| ctx.cfg.aggregator.model.clone());
     let dream = Dream {
-        id: id.clone(),
+        id,
         project: d.project.clone(),
         status: DreamStatus::Pending,
-        model: model.clone(),
+        model,
         instructions: opts.instructions.clone(),
         session_ids: sessions.iter().map(|s| s.id.clone()).collect(),
         created_at: Utc::now(),
@@ -200,6 +214,37 @@ pub async fn run_dream(
     };
     ctx.db.upsert_project(&d.project)?;
     ctx.db.insert_dream(&dream)?;
+    Ok(DreamOutcome::Done(dream))
+}
+
+/// Run the pipeline for a dream inserted by [`prepare`] and return its final
+/// state (completed, failed or canceled). Session transcripts are the
+/// dream's `session_ids` under `<config_dir>/projects/<slug>/`.
+pub async fn execute(ctx: &Ctx, dream: Dream, opts: DreamOpts) -> anyhow::Result<Dream> {
+    let id = dream.id.clone();
+    let dir = dream_dir(&ctx.cfg, &id);
+    let project_dir = dream
+        .project
+        .config_dir
+        .join("projects")
+        .join(&dream.project.slug);
+    let sessions: Vec<SessionFile> = dream
+        .session_ids
+        .iter()
+        .map(|sid| {
+            let path = project_dir.join(format!("{sid}.jsonl"));
+            let mtime = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .map(chrono::DateTime::<Utc>::from)
+                .unwrap_or_else(|_| Utc::now());
+            SessionFile {
+                id: sid.clone(),
+                path,
+                mtime,
+            }
+        })
+        .collect();
+    let model = dream.model.clone();
 
     let mut usage = Usage::default();
     let res = pipeline(ctx, &dream, &dir, &sessions, &opts, &model, &mut usage).await;
@@ -237,7 +282,7 @@ pub async fn run_dream(
         ),
         _ => {}
     }
-    Ok(DreamOutcome::Done(done))
+    Ok(done)
 }
 
 async fn pipeline(
@@ -255,6 +300,11 @@ async fn pipeline(
     let out_dir = dir.join("out");
     let memory_dir = &dream.project.memory_dir;
 
+    // Canceled while still pending (e.g. via the API before the task ran).
+    if canceled(ctx, id)? {
+        return Ok(Stop::Canceled);
+    }
+
     // 1. Snapshot + clone.
     copy_dir(memory_dir, &in_dir)
         .with_context(|| format!("snapshot {} → in/", memory_dir.display()))?;
@@ -263,7 +313,9 @@ async fn pipeline(
     let in_hash = hash_dir(&in_dir).context("hash in/")?;
     std::fs::write(dir.join("in.sha256"), format!("{in_hash}\n")).context("write in.sha256")?;
     db.update_status(id, DreamStatus::Running, None)?;
-    db.set_pid(id, Some(std::process::id()))?;
+    // A server-run dream records no pid: a CLI `cancel` must not SIGTERM
+    // the API server; it cancels through the status column instead.
+    db.set_pid(id, (!opts.no_pid).then(std::process::id))?;
 
     // 2. Reduce transcripts.
     let mut digests = Vec::new();

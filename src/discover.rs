@@ -132,6 +132,37 @@ pub fn discover(
     Ok(out)
 }
 
+/// Find the projects a `dream` selector names: a slug, or a path compared
+/// with each project's cwd. `None` selector = every project (`--all`).
+pub fn select_projects(
+    found: Vec<DiscoveredProject>,
+    selector: Option<&str>,
+) -> Vec<DiscoveredProject> {
+    let Some(sel) = selector else {
+        return found;
+    };
+    let as_path = std::path::Path::new(sel);
+    let canon = std::fs::canonicalize(as_path).ok();
+    let by_slug: Vec<_> = found
+        .iter()
+        .filter(|d| d.project.slug == sel)
+        .cloned()
+        .collect();
+    if !by_slug.is_empty() {
+        return by_slug.into_iter().take(1).collect();
+    }
+    found
+        .into_iter()
+        .filter(|d| {
+            d.project
+                .cwd
+                .as_deref()
+                .is_some_and(|c| c == as_path || canon.as_deref().is_some_and(|k| k == c))
+        })
+        .take(1)
+        .collect()
+}
+
 fn has_md(dir: &Path) -> bool {
     std::fs::read_dir(dir)
         .map(|rd| {
