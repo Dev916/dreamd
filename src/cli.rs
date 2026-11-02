@@ -120,6 +120,9 @@ pub enum Command {
         dream_dir: PathBuf,
         #[arg(required = true)]
         transcripts: Vec<PathBuf>,
+        /// Per-worker timeout in seconds (default: worker timeout_secs).
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// (debug) Post-check an out/ dir against its in/ snapshot.
     #[command(hide = true)]

@@ -6,6 +6,7 @@ mod discover;
 mod doctor;
 mod model;
 mod transcript;
+mod worker;
 
 use clap::Parser;
 
@@ -180,8 +181,90 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 }
             }
         }
+        Command::Mine {
+            dream_dir,
+            transcripts,
+            timeout,
+        } => mine(&cfg, &dream_dir, transcripts, timeout).await,
         _ => anyhow::bail!("not implemented"),
     }
+}
+
+/// `mine`: reduce each transcript, fan workers out into `<dream_dir>/findings/`,
+/// print one line per session plus `N ok, M failed`. Exit 4 if every worker failed.
+async fn mine(
+    cfg: &config::Config,
+    dream_dir: &std::path::Path,
+    transcripts: Vec<std::path::PathBuf>,
+    timeout: Option<u64>,
+) -> anyhow::Result<i32> {
+    let mut wcfg = cfg.worker.clone();
+    if let Some(t) = timeout {
+        wcfg.timeout_secs = t;
+    }
+    // The memory index the workers see: the dream's input snapshot, if any.
+    let memory_index =
+        std::fs::read_to_string(dream_dir.join("in").join("MEMORY.md")).unwrap_or_default();
+    let mut digests = Vec::new();
+    let mut paths = Vec::new();
+    let mut unreadable = Vec::new();
+    for t in transcripts {
+        match transcript::reduce(&t, wcfg.max_transcript_bytes) {
+            Ok(d) => {
+                paths.push(t);
+                digests.push(d);
+            }
+            Err(e) => unreadable.push((t, e)),
+        }
+    }
+    let claude: std::sync::Arc<dyn Claude> = std::sync::Arc::new(CliClaude {
+        bin: cfg.claude_bin.clone(),
+    });
+    let mut outcomes = worker::mine_sessions(
+        claude,
+        &wcfg,
+        memory_index,
+        digests,
+        &dream_dir.join("findings"),
+    )
+    .await;
+    for (o, p) in outcomes.iter_mut().zip(paths) {
+        o.record.transcript_path = p;
+    }
+    for (t, e) in unreadable {
+        outcomes.push(worker::SessionOutcome {
+            record: model::SessionRecord {
+                session_id: t
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                transcript_path: t,
+                status: model::SessionStatus::Failed,
+                findings_path: None,
+                usage: model::Usage::default(),
+                error: Some(format!("{e:#}")),
+                duration_ms: 0,
+            },
+            findings: None,
+        });
+    }
+    let ok = outcomes
+        .iter()
+        .filter(|o| o.record.status == model::SessionStatus::Ok)
+        .count();
+    for o in &outcomes {
+        let r = &o.record;
+        match &r.error {
+            Some(e) => println!("{}  {}  {}ms  {e}", r.session_id, r.status, r.duration_ms),
+            None => println!("{}  {}  {}ms", r.session_id, r.status, r.duration_ms),
+        }
+    }
+    println!("{ok} ok, {} failed", outcomes.len() - ok);
+    if worker::all_failed(&outcomes) {
+        eprintln!("all workers failed");
+        return Ok(EXIT_FAILED);
+    }
+    Ok(EXIT_OK)
 }
 
 /// Human-readable `show` output.
