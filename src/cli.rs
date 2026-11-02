@@ -10,8 +10,7 @@ pub const EXIT_OK: i32 = 0;
 /// Gate-skipped / nothing to do.
 #[allow(dead_code)]
 pub const EXIT_SKIPPED: i32 = 2;
-/// Refused (hash mismatch, bad status).
-#[allow(dead_code)]
+/// Refused (hash mismatch, bad status, unknown dream).
 pub const EXIT_REFUSED: i32 = 3;
 /// Dream failed.
 #[allow(dead_code)]
