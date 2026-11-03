@@ -58,9 +58,17 @@ pub enum Command {
         /// Explicit session ids (comma-separated); bypasses the gate.
         #[arg(long, value_delimiter = ',')]
         sessions: Vec<String>,
-        /// Show what would be dreamed without running any model.
+        /// Print the run plan (projects, sessions, model calls); run nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Only mine transcripts modified in the last N days, overriding
+        /// `limits.backfill_days` and the last-dream cutoff (0 = no window).
+        #[arg(long, value_name = "N")]
+        since_days: Option<u64>,
+        /// Mine at most N sessions per dream (overrides
+        /// `limits.max_sessions_per_dream`).
+        #[arg(long, value_name = "N")]
+        max_sessions: Option<usize>,
     },
     /// List dreams.
     List,

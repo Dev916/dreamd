@@ -20,6 +20,24 @@ pub struct Config {
     pub worker: WorkerCfg,
     pub aggregator: AggCfg,
     pub schedule: ScheduleCfg,
+    pub limits: LimitsCfg,
+}
+
+/// Quota caps: how many `claude -p` calls a dream / a nightly run may make.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LimitsCfg {
+    /// Newest candidate sessions one dream mines (worker calls per dream).
+    pub max_sessions_per_dream: usize,
+    /// Worker calls one `dream --all` run may spend across projects.
+    pub max_sessions_per_run: usize,
+    /// Projects one `dream --all` run may dream.
+    pub max_projects_per_run: usize,
+    /// A never-dreamed project only considers transcripts modified within
+    /// this many days (`0` = no window).
+    pub backfill_days: u64,
+    /// Transcripts smaller than this are never candidates.
+    pub min_transcript_bytes: u64,
 }
 
 /// Per-session miner settings.
@@ -73,6 +91,19 @@ impl Default for Config {
             worker: WorkerCfg::default(),
             aggregator: AggCfg::default(),
             schedule: ScheduleCfg::default(),
+            limits: LimitsCfg::default(),
+        }
+    }
+}
+
+impl Default for LimitsCfg {
+    fn default() -> Self {
+        LimitsCfg {
+            max_sessions_per_dream: 10,
+            max_sessions_per_run: 30,
+            max_projects_per_run: 5,
+            backfill_days: 14,
+            min_transcript_bytes: 8192,
         }
     }
 }
@@ -215,6 +246,11 @@ mod tests {
         assert_eq!(c.schedule.hour, 3);
         assert_eq!(c.schedule.minute, 30);
         assert!(!c.schedule.auto_apply);
+        assert_eq!(c.limits.max_sessions_per_dream, 10);
+        assert_eq!(c.limits.max_sessions_per_run, 30);
+        assert_eq!(c.limits.max_projects_per_run, 5);
+        assert_eq!(c.limits.backfill_days, 14);
+        assert_eq!(c.limits.min_transcript_bytes, 8192);
         assert_eq!(c.config_dirs.len(), 3);
         assert!(c.config_dirs[0].ends_with(".claude"));
         assert_eq!(c.dreams_dir(), c.data_dir.join("dreams"));

@@ -12,7 +12,8 @@ use crate::model::{Project, SessionFile};
 
 /// A session modified more recently than this is considered live.
 pub const LIVE_WINDOW_MINUTES: i64 = 10;
-/// Maximum sessions per dream (matches the hosted Dreams API limit).
+/// Maximum candidate sessions considered per project (matches the hosted
+/// Dreams API limit). A dream mines at most `limits.max_sessions_per_dream`.
 pub const MAX_SESSIONS: usize = 100;
 
 /// A dreamable project plus what a dream would consume right now.
@@ -48,6 +49,8 @@ pub struct ScanRow {
     pub memory_dir: PathBuf,
     pub cwd: Option<PathBuf>,
     pub candidate_sessions: usize,
+    /// Sessions a single dream would mine under the current caps.
+    pub selected_sessions: usize,
     pub last_dreamed_at: Option<DateTime<Utc>>,
     pub verdict: String,
 }
@@ -60,6 +63,10 @@ impl ScanRow {
             memory_dir: d.project.memory_dir.clone(),
             cwd: d.project.cwd.clone(),
             candidate_sessions: d.candidate_sessions.len(),
+            selected_sessions: d
+                .candidate_sessions
+                .len()
+                .min(cfg.limits.max_sessions_per_dream),
             last_dreamed_at: d.last_dreamed_at,
             verdict: gate(d, cfg, false).to_string(),
         }
@@ -72,9 +79,10 @@ impl ScanRow {
             .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
             .unwrap_or_else(|| "never".into());
         format!(
-            "{}  sessions={}  last={}  verdict={}  dir={}",
+            "{}  sessions={}  selected={}  last={}  verdict={}  dir={}",
             self.slug,
             self.candidate_sessions,
+            self.selected_sessions,
             last,
             self.verdict,
             self.config_dir.display()
@@ -89,6 +97,34 @@ pub fn discover(
     cfg: &Config,
     db: &Db,
     now: DateTime<Utc>,
+) -> anyhow::Result<Vec<DiscoveredProject>> {
+    discover_with(cfg, db, now, None)
+}
+
+/// The oldest transcript mtime a project's candidates may have (exclusive):
+/// `since_days` (CLI `--since-days`) wins when given (`0` = no limit);
+/// otherwise the last dream, or for a never-dreamed project the
+/// `limits.backfill_days` window (`0` = no limit).
+pub fn candidate_cutoff(
+    cfg: &Config,
+    last: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    since_days: Option<u64>,
+) -> Option<DateTime<Utc>> {
+    let window = |days: u64| (days > 0).then(|| now - Duration::days(days as i64));
+    match since_days {
+        Some(days) => window(days),
+        None => last.or_else(|| window(cfg.limits.backfill_days)),
+    }
+}
+
+/// [`discover`] with an optional `--since-days` override of the candidate
+/// window (see [`candidate_cutoff`]).
+pub fn discover_with(
+    cfg: &Config,
+    db: &Db,
+    now: DateTime<Utc>,
+    since_days: Option<u64>,
 ) -> anyhow::Result<Vec<DiscoveredProject>> {
     let mut out = Vec::new();
     for config_dir in &cfg.config_dirs {
@@ -122,7 +158,12 @@ pub fn discover(
             let last = db.last_dreamed_at(&project)?;
             let hours_since = last.map(|t| (now - t).num_seconds() as f64 / 3600.0);
             out.push(DiscoveredProject {
-                candidate_sessions: candidate_sessions(&project_dir, last, now),
+                candidate_sessions: candidate_sessions(
+                    &project_dir,
+                    candidate_cutoff(cfg, last, now, since_days),
+                    now,
+                    cfg.limits.min_transcript_bytes,
+                ),
                 project,
                 last_dreamed_at: last,
                 hours_since,
@@ -173,11 +214,13 @@ fn has_md(dir: &Path) -> bool {
 }
 
 /// `*.jsonl` directly in `project_dir` with `mtime > since` (all when
-/// `since` is `None`) and at least 10 minutes old, newest first, capped at 100.
+/// `since` is `None`), at least 10 minutes old and at least `min_bytes`
+/// long, newest first, capped at 100.
 pub fn candidate_sessions(
     project_dir: &Path,
     since: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
+    min_bytes: u64,
 ) -> Vec<SessionFile> {
     let Ok(rd) = std::fs::read_dir(project_dir) else {
         return Vec::new();
@@ -188,7 +231,11 @@ pub fn candidate_sessions(
         .map(|e| e.path())
         .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "jsonl"))
         .filter_map(|path| {
-            let mtime: DateTime<Utc> = std::fs::metadata(&path).ok()?.modified().ok()?.into();
+            let meta = std::fs::metadata(&path).ok()?;
+            if meta.len() < min_bytes {
+                return None;
+            }
+            let mtime: DateTime<Utc> = meta.modified().ok()?.into();
             let id = path.file_stem()?.to_str()?.to_string();
             Some(SessionFile { id, path, mtime })
         })
@@ -218,6 +265,121 @@ pub fn gate(d: &DiscoveredProject, cfg: &Config, force: bool) -> Gate {
         return Gate::Skip(format!("need {} sessions, have {}", cfg.min_sessions, n));
     }
     Gate::Run
+}
+
+/// Caps a run plan applies.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RunCaps {
+    pub per_dream: usize,
+    pub per_run: usize,
+    pub projects: usize,
+}
+
+impl RunCaps {
+    /// The `--all` caps from config, with an optional `--max-sessions`
+    /// override of the per-dream cap.
+    pub fn for_all(cfg: &Config, max_sessions: Option<usize>) -> RunCaps {
+        RunCaps {
+            per_dream: max_sessions.unwrap_or(cfg.limits.max_sessions_per_dream),
+            per_run: cfg.limits.max_sessions_per_run,
+            projects: cfg.limits.max_projects_per_run,
+        }
+    }
+
+    /// A single-project dream: only the per-dream cap applies.
+    pub fn for_one(cfg: &Config, max_sessions: Option<usize>) -> RunCaps {
+        RunCaps {
+            per_dream: max_sessions.unwrap_or(cfg.limits.max_sessions_per_dream),
+            per_run: usize::MAX,
+            projects: usize::MAX,
+        }
+    }
+}
+
+/// One project in a run plan.
+#[derive(Debug, Clone)]
+pub enum PlanItem {
+    /// Dream it, mining the newest `take` candidate sessions.
+    Run {
+        project: DiscoveredProject,
+        take: usize,
+    },
+    /// Due, but the run's project or session budget is spent.
+    Deferred(DiscoveredProject),
+    /// Not due (gate verdict) or nothing to mine.
+    Skipped(DiscoveredProject, String),
+}
+
+/// What a dream run will do, decided before anything runs.
+#[derive(Debug, Clone, Default)]
+pub struct RunPlan {
+    /// `Run` items in execution order, then `Deferred`, then `Skipped`.
+    pub items: Vec<PlanItem>,
+}
+
+impl RunPlan {
+    /// Projects that will be dreamed (= aggregator calls).
+    pub fn projects(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|i| matches!(i, PlanItem::Run { .. }))
+            .count()
+    }
+
+    /// Sessions that will be mined (= worker calls).
+    pub fn sessions(&self) -> usize {
+        self.items
+            .iter()
+            .map(|i| match i {
+                PlanItem::Run { take, .. } => *take,
+                _ => 0,
+            })
+            .sum()
+    }
+}
+
+/// Plan a run: gate every project, order the due ones by their newest
+/// candidate (most recently active first), then hand out sessions
+/// newest-first — up to `caps.per_dream` each, `caps.per_run` in total,
+/// `caps.projects` projects. A due project left with no budget is deferred.
+pub fn plan_run(
+    found: Vec<DiscoveredProject>,
+    cfg: &Config,
+    force: bool,
+    caps: RunCaps,
+) -> RunPlan {
+    let mut due = Vec::new();
+    let mut skipped = Vec::new();
+    for d in found {
+        match gate(&d, cfg, force) {
+            Gate::Skip(why) => skipped.push(PlanItem::Skipped(d, why)),
+            Gate::Run if d.candidate_sessions.is_empty() => {
+                skipped.push(PlanItem::Skipped(d, "no candidate sessions".into()))
+            }
+            Gate::Run => due.push(d),
+        }
+    }
+    due.sort_by(|a, b| {
+        let newest = |d: &DiscoveredProject| d.candidate_sessions.first().map(|s| s.mtime);
+        newest(b)
+            .cmp(&newest(a))
+            .then_with(|| a.project.slug.cmp(&b.project.slug))
+    });
+    let mut items = Vec::new();
+    let mut deferred = Vec::new();
+    let mut budget = caps.per_run;
+    for d in due {
+        let take = d.candidate_sessions.len().min(caps.per_dream).min(budget);
+        if take == 0 || items.len() >= caps.projects {
+            deferred.push(PlanItem::Deferred(d));
+            continue;
+        }
+        budget -= take;
+        items.push(PlanItem::Run { project: d, take });
+    }
+    items.extend(deferred);
+    items.extend(skipped);
+    RunPlan { items }
 }
 
 /// The project's memory dir: `autoMemoryDirectory` from
@@ -301,12 +463,12 @@ mod tests {
         write_session(tmp.path(), "fresh", Duration::hours(2), now);
         std::fs::write(tmp.path().join("notes.txt"), "x").unwrap();
         let since = Some(now - Duration::hours(24));
-        let ids: Vec<_> = candidate_sessions(tmp.path(), since, now)
+        let ids: Vec<_> = candidate_sessions(tmp.path(), since, now, 0)
             .into_iter()
             .map(|s| s.id)
             .collect();
         assert_eq!(ids, vec!["fresh"]);
-        let all: Vec<_> = candidate_sessions(tmp.path(), None, now)
+        let all: Vec<_> = candidate_sessions(tmp.path(), None, now, 0)
             .into_iter()
             .map(|s| s.id)
             .collect();
@@ -320,11 +482,109 @@ mod tests {
         for i in 0..105 {
             write_session(tmp.path(), &format!("s{i:03}"), Duration::hours(1 + i), now);
         }
-        let c = candidate_sessions(tmp.path(), None, now);
+        let c = candidate_sessions(tmp.path(), None, now, 0);
         assert_eq!(c.len(), 100);
         assert_eq!(c[0].id, "s000");
         assert_eq!(c[99].id, "s099");
         assert!(c.windows(2).all(|w| w[0].mtime >= w[1].mtime));
+    }
+
+    #[test]
+    fn candidates_exclude_small_transcripts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let p = write_session(tmp.path(), "small", Duration::hours(2), now);
+        let len = std::fs::metadata(&p).unwrap().len();
+        assert_eq!(candidate_sessions(tmp.path(), None, now, len).len(), 1);
+        assert!(candidate_sessions(tmp.path(), None, now, len + 1).is_empty());
+    }
+
+    #[test]
+    fn cutoff_backfill_window_last_dream_and_override() {
+        let cfg = Config::default();
+        let now = Utc::now();
+        let last = now - Duration::hours(30);
+        assert_eq!(
+            candidate_cutoff(&cfg, None, now, None),
+            Some(now - Duration::days(14))
+        );
+        assert_eq!(candidate_cutoff(&cfg, Some(last), now, None), Some(last));
+        assert_eq!(candidate_cutoff(&cfg, Some(last), now, Some(0)), None);
+        assert_eq!(
+            candidate_cutoff(&cfg, Some(last), now, Some(3)),
+            Some(now - Duration::days(3))
+        );
+        let mut c0 = cfg.clone();
+        c0.limits.backfill_days = 0;
+        assert_eq!(candidate_cutoff(&c0, None, now, None), None);
+    }
+
+    fn named(slug: &str, n: usize, newest_age_h: i64) -> DiscoveredProject {
+        let mut d = discovered(n, None);
+        d.project.slug = slug.into();
+        let now = Utc::now();
+        for (i, s) in d.candidate_sessions.iter_mut().enumerate() {
+            s.mtime = now - Duration::hours(newest_age_h + i as i64);
+        }
+        d
+    }
+
+    fn summary(p: &RunPlan) -> Vec<String> {
+        p.items
+            .iter()
+            .map(|i| match i {
+                PlanItem::Run { project, take } => format!("run {} {take}", project.project.slug),
+                PlanItem::Deferred(d) => format!("defer {}", d.project.slug),
+                PlanItem::Skipped(d, _) => format!("skip {}", d.project.slug),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plan_orders_by_activity_and_spends_budget() {
+        let cfg = Config::default();
+        let found = vec![
+            named("-a", 5, 30),
+            named("-b", 5, 10),
+            named("-c", 2, 20),
+            named("-d", 4, 1),
+        ];
+        let caps = RunCaps {
+            per_dream: 3,
+            per_run: 7,
+            projects: 3,
+        };
+        let plan = plan_run(found, &cfg, false, caps);
+        assert_eq!(
+            summary(&plan),
+            vec!["run -d 3", "run -b 3", "run -a 1", "skip -c"]
+        );
+        assert_eq!(plan.projects(), 3);
+        assert_eq!(plan.sessions(), 7);
+    }
+
+    #[test]
+    fn plan_defers_past_project_cap_and_empty_budget() {
+        let cfg = Config::default();
+        let found = vec![named("-a", 3, 1), named("-b", 3, 2), named("-c", 3, 3)];
+        let caps = RunCaps {
+            per_dream: 3,
+            per_run: 3,
+            projects: 5,
+        };
+        assert_eq!(
+            summary(&plan_run(found.clone(), &cfg, false, caps)),
+            vec!["run -a 3", "defer -b", "defer -c"]
+        );
+        let caps = RunCaps {
+            per_dream: 1,
+            per_run: 30,
+            projects: 2,
+        };
+        assert_eq!(
+            summary(&plan_run(found, &cfg, false, caps)),
+            vec!["run -a 1", "run -b 1", "defer -c"]
+        );
     }
 
     #[test]

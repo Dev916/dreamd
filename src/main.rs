@@ -125,16 +125,19 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             instructions,
             sessions,
             dry_run,
+            since_days,
+            max_sessions,
         } => {
             let opts = dream::DreamOpts {
                 force,
                 model,
                 instructions,
                 session_ids: (!sessions.is_empty()).then_some(sessions),
+                max_sessions,
                 dry_run,
                 no_pid: false,
             };
-            dream_cmd(selector.as_deref(), all, opts).await
+            dream_cmd(selector.as_deref(), all, opts, since_days).await
         }
         Command::Diff { id } => artifact_cmd(&cfg, &id, "dream.diff"),
         Command::Summary { id } => artifact_cmd(&cfg, &id, "aggregate.md"),
@@ -165,6 +168,19 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             for r in &rows {
                 println!("{}", r.render());
             }
+            let plan =
+                discover::plan_run(found, &cfg, false, discover::RunCaps::for_all(&cfg, None));
+            let l = &cfg.limits;
+            println!(
+                "next --all run: {} projects, {} worker calls (caps: {}/dream, {}/run, {} projects/run, {}d backfill, min {} bytes)",
+                plan.projects(),
+                plan.sessions(),
+                l.max_sessions_per_dream,
+                l.max_sessions_per_run,
+                l.max_projects_per_run,
+                l.backfill_days,
+                l.min_transcript_bytes
+            );
             Ok(EXIT_OK)
         }
         Command::Digest { path, max_bytes } => {
@@ -370,15 +386,18 @@ fn postcheck_cmd(in_dir: &std::path::Path, out_dir: &std::path::Path) -> anyhow:
     Ok(EXIT_OK)
 }
 
-/// `dream <selector>|--all`: run the pipeline, print one line per project.
+/// `dream <selector>|--all`: plan the run (gate, order, caps), then run the
+/// plan one project at a time, printing one line per project. With
+/// `--dry-run`, print the plan and stop.
 async fn dream_cmd(
     selector: Option<&str>,
     all: bool,
-    opts: dream::DreamOpts,
+    mut opts: dream::DreamOpts,
+    since_days: Option<u64>,
 ) -> anyhow::Result<i32> {
     let ctx = dream::Ctx::from_env()?;
     sweep(&ctx.cfg, &ctx.db)?;
-    let found = discover::discover(&ctx.cfg, &ctx.db, chrono::Utc::now())?;
+    let found = discover::discover_with(&ctx.cfg, &ctx.db, chrono::Utc::now(), since_days)?;
     let targets = discover::select_projects(found, if all { None } else { selector });
     if targets.is_empty() {
         if all {
@@ -388,10 +407,51 @@ async fn dream_cmd(
         eprintln!("project not found: {}", selector.unwrap_or_default());
         return Ok(EXIT_REFUSED);
     }
-    let auto_apply = all && ctx.cfg.schedule.auto_apply && !opts.dry_run;
+    let explicit = opts.session_ids.clone();
+    let plan = match &explicit {
+        // Explicit sessions bypass the gate and every cap.
+        Some(ids) => discover::RunPlan {
+            items: targets
+                .into_iter()
+                .map(|project| discover::PlanItem::Run {
+                    project,
+                    take: ids.len(),
+                })
+                .collect(),
+        },
+        None => {
+            let caps = if all {
+                discover::RunCaps::for_all(&ctx.cfg, opts.max_sessions)
+            } else {
+                discover::RunCaps::for_one(&ctx.cfg, opts.max_sessions)
+            };
+            discover::plan_run(targets, &ctx.cfg, opts.force, caps)
+        }
+    };
+    if opts.dry_run {
+        return Ok(print_plan(&ctx, &plan, explicit.as_deref()));
+    }
+
+    let auto_apply = all && ctx.cfg.schedule.auto_apply;
     let (mut completed, mut failed, mut busy) = (0usize, 0usize, 0usize);
-    for d in targets {
+    for item in plan.items {
+        let (d, take) = match item {
+            discover::PlanItem::Run { project, take } => (project, take),
+            discover::PlanItem::Deferred(d) => {
+                println!(
+                    "deferred {}: run budget exhausted ({} candidates)",
+                    d.project.slug,
+                    d.candidate_sessions.len()
+                );
+                continue;
+            }
+            discover::PlanItem::Skipped(d, why) => {
+                println!("skipped {}: {why}", d.project.slug);
+                continue;
+            }
+        };
         let slug = d.project.slug.clone();
+        opts.max_sessions = Some(take);
         let outcome = match dream::run_dream(&ctx, d, opts.clone()).await {
             Ok(o) => o,
             // --all keeps going past one broken project (nightly job).
@@ -403,7 +463,6 @@ async fn dream_cmd(
             Err(e) => return Err(e),
         };
         match outcome {
-            dream::DreamOutcome::Skipped(_) if opts.dry_run => completed += 1,
             dream::DreamOutcome::Skipped(why) => println!("skipped {slug}: {why}"),
             dream::DreamOutcome::Busy(why) => {
                 busy += 1;
@@ -460,6 +519,67 @@ async fn dream_cmd(
     } else {
         EXIT_SKIPPED
     })
+}
+
+/// `dream --dry-run`: one line per project (`plan`, `deferred`, `skipped`),
+/// each planned session's reduced size, then the totals. Exit 2 when
+/// nothing would run.
+fn print_plan(ctx: &dream::Ctx, plan: &discover::RunPlan, explicit: Option<&[String]>) -> i32 {
+    for item in &plan.items {
+        match item {
+            discover::PlanItem::Run { project, take } => {
+                let sessions: Vec<std::path::PathBuf> = match explicit {
+                    Some(ids) => {
+                        let dir = project
+                            .project
+                            .config_dir
+                            .join("projects")
+                            .join(&project.project.slug);
+                        ids.iter()
+                            .map(|id| dir.join(format!("{id}.jsonl")))
+                            .collect()
+                    }
+                    None => project
+                        .candidate_sessions
+                        .iter()
+                        .take(*take)
+                        .map(|s| s.path.clone())
+                        .collect(),
+                };
+                let n = if explicit.is_some() {
+                    *take
+                } else {
+                    project.candidate_sessions.len()
+                };
+                println!("plan {}: {take} of {n} sessions", project.project.slug);
+                for p in sessions {
+                    let id = p.file_stem().unwrap_or_default().to_string_lossy();
+                    match transcript::reduce(&p, ctx.cfg.worker.max_transcript_bytes) {
+                        Ok(dg) => println!(
+                            "  {id}  {} → {} bytes{}",
+                            dg.bytes_in,
+                            dg.bytes_out,
+                            if dg.elided { " (elided)" } else { "" }
+                        ),
+                        Err(e) => println!("  {id}  unreadable: {e:#}"),
+                    }
+                }
+            }
+            discover::PlanItem::Deferred(d) => println!(
+                "deferred {}: run budget exhausted ({} candidates)",
+                d.project.slug,
+                d.candidate_sessions.len()
+            ),
+            discover::PlanItem::Skipped(d, why) => println!("skipped {}: {why}", d.project.slug),
+        }
+    }
+    let (p, s) = (plan.projects(), plan.sessions());
+    println!("plan: {p} projects, {s} worker calls, {p} aggregator calls");
+    if p == 0 {
+        EXIT_SKIPPED
+    } else {
+        EXIT_OK
+    }
 }
 
 /// `diff` / `summary`: print a dream dir artifact verbatim.

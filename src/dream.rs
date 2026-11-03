@@ -70,6 +70,9 @@ pub struct DreamOpts {
     pub instructions: Option<String>,
     /// Explicit sessions: bypasses the gate and restricts candidates.
     pub session_ids: Option<Vec<String>>,
+    /// Mine at most this many (newest) candidate sessions; `None` =
+    /// `limits.max_sessions_per_dream`. Ignored with `session_ids`.
+    pub max_sessions: Option<usize>,
     pub dry_run: bool,
     /// Do not record this process's pid on the dream (the API server sets
     /// this so a CLI `cancel` never signals the server).
@@ -126,10 +129,11 @@ fn select_sessions(
     d: &DiscoveredProject,
     opts: &DreamOpts,
 ) -> Result<Vec<SessionFile>, String> {
-    let sessions = match &opts.session_ids {
+    let sessions: Vec<SessionFile> = match &opts.session_ids {
         Some(ids) => {
             let project_dir = d.project.config_dir.join("projects").join(&d.project.slug);
-            let all = candidate_sessions(&project_dir, None, Utc::now());
+            // Explicit ids bypass every cap (window, size, count).
+            let all = candidate_sessions(&project_dir, None, Utc::now(), 0);
             let missing: Vec<&str> = ids
                 .iter()
                 .filter(|id| !all.iter().any(|s| &s.id == *id))
@@ -147,7 +151,11 @@ fn select_sessions(
             if let Gate::Skip(why) = gate(d, &ctx.cfg, opts.force) {
                 return Err(why);
             }
-            d.candidate_sessions.clone()
+            let max = opts
+                .max_sessions
+                .unwrap_or(ctx.cfg.limits.max_sessions_per_dream);
+            // Candidates are newest first.
+            d.candidate_sessions.iter().take(max).cloned().collect()
         }
     };
     if sessions.is_empty() {

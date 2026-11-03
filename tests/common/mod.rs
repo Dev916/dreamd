@@ -96,7 +96,7 @@ pub fn add_project(config_dir: &Path, slug: &str) -> PathBuf {
     let two_hours_ago = SystemTime::now() - Duration::from_secs(2 * 3600);
     for name in ["s1.jsonl", "s2.jsonl", "s3.jsonl"] {
         let dst = project_dir.join(name);
-        std::fs::copy(fixtures_dir().join(name), &dst).unwrap();
+        copy_padded(name, &dst);
         set_mtime(&dst, two_hours_ago);
     }
 
@@ -117,6 +117,46 @@ pub fn add_project(config_dir: &Path, slug: &str) -> PathBuf {
     )
     .unwrap();
     project_dir
+}
+
+/// Padding so fixture transcripts clear the default `min_transcript_bytes`
+/// (8192): one `progress` record, which the reducer drops.
+pub const PAD_BYTES: usize = 9000;
+
+/// Copy fixture transcript `name` to `dst`, padded past 8 KiB.
+pub fn copy_padded(name: &str, dst: &Path) {
+    let mut text = std::fs::read_to_string(fixtures_dir().join(name)).unwrap();
+    text.push_str(&format!(
+        "{{\"type\": \"progress\", \"data\": {{\"output\": \"{}\"}}}}\n",
+        "x".repeat(PAD_BYTES)
+    ));
+    std::fs::write(dst, text).unwrap();
+}
+
+/// Add copies of `s1.jsonl` named `s4..=s<total>` to `project_dir`; `s<i>`
+/// is aged 2h - i minutes, so higher numbers are newer (all older than the
+/// live window).
+pub fn add_transcripts(project_dir: &Path, total: usize) {
+    for i in 4..=total {
+        let dst = project_dir.join(format!("s{i}.jsonl"));
+        copy_padded("s1.jsonl", &dst);
+        set_age(&dst, Duration::from_secs(2 * 3600 - 60 * i as u64));
+    }
+}
+
+/// Set a file's mtime to now - `age`.
+pub fn set_age(path: &Path, age: Duration) {
+    set_mtime(path, SystemTime::now() - age);
+}
+
+/// Set every transcript in `project_dir` to now - `age`.
+pub fn age_project(project_dir: &Path, age: Duration) {
+    for e in std::fs::read_dir(project_dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().is_some_and(|x| x == "jsonl") {
+            set_age(&p, age);
+        }
+    }
 }
 
 /// Set a file's mtime to now - 2h (an aged, dreamable transcript).

@@ -17,7 +17,7 @@ fn scan_fresh_project_verdict_run() {
         .assert()
         .code(0)
         .stdout(predicate::str::contains(
-            "-tmp-proj  sessions=3  last=never  verdict=run",
+            "-tmp-proj  sessions=3  selected=3  last=never  verdict=run",
         ));
 }
 
@@ -30,7 +30,7 @@ fn scan_live_session_excluded_and_gate_skips() {
         .assert()
         .code(0)
         .stdout(predicate::str::contains(
-            "sessions=2  last=never  verdict=skip (need 3 sessions, have 2)",
+            "sessions=2  selected=2  last=never  verdict=skip (need 3 sessions, have 2)",
         ));
 }
 
@@ -75,12 +75,14 @@ fn scan_json_has_expected_keys() {
             "cwd",
             "last_dreamed_at",
             "memory_dir",
+            "selected_sessions",
             "slug",
             "verdict"
         ]
     );
     assert_eq!(obj["slug"], SLUG);
     assert_eq!(obj["candidate_sessions"], 3);
+    assert_eq!(obj["selected_sessions"], 3);
     assert_eq!(obj["cwd"], "/tmp/proj");
     assert_eq!(obj["last_dreamed_at"], serde_json::Value::Null);
     assert_eq!(obj["verdict"], "run");

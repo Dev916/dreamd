@@ -347,6 +347,7 @@ async fn create_dream(
         model: body.model,
         instructions: body.instructions,
         session_ids: body.session_ids.filter(|v| !v.is_empty()),
+        max_sessions: None,
         dry_run: false,
         no_pid: true,
     };
