@@ -43,19 +43,25 @@ fan-in, the hash guard on apply, and the review loop.
 
 ```mermaid
 flowchart TD
-    S0["0. Discover<br/>config dirs → projects with memory/<br/>candidate sessions newer than the cutoff,<br/>older than 10 min, ≥ 8 KB"]
+    S0["0. Discover<br/>config dirs → projects with memory/<br/>candidate sessions: ≥ 8 KB not yet mined<br/>(grown past their mark, or new since the cutoff),<br/>older than 10 min"]
     S1["1. Snapshot + clone<br/>memory/ → in/ (hashed) and out/<br/>CLAUDE.md → context/"]
-    S2["2. Reduce (Rust, no tokens)<br/>JSONL → digest: user/assistant text,<br/>tool names, tool errors; images dropped"]
+    S2["2. Reduce (Rust, no tokens)<br/>JSONL → digest: user/assistant text,<br/>tool names, tool errors; images dropped;<br/>a marked session: only records past its mark,<br/>after 6 records of earlier context"]
     S3["3. Fan-out workers<br/>one claude -p per session,<br/>plan mode, JSON-schema findings<br/>with evidence quotes"]
     S4["4. Aggregate<br/>one claude -p in out/,<br/>acceptEdits, scoped Write/Edit,<br/>four phases + findings"]
     S5["5. Post-check<br/>frontmatter, index links,<br/>no writes outside out/,<br/>live dir hash unchanged,<br/>permission mode asserted"]
     S6["6. Report<br/>dream.diff, aggregate.md,<br/>notification"]
     S0 --> S1 --> S2 --> S3 --> S4 --> S5 --> S6
+    S3 -. "no findings at all:<br/>aggregator skipped, empty diff" .-> S6
     S5 -. "any violation" .-> F["status: failed<br/>(out/ kept for inspection)"]
 ```
 
 The only steps that spend tokens are 3 and 4. Everything else is Rust, which is what keeps a nightly
-run cheap and deterministic. Workers see a digest, not a raw transcript, and must cite a session id and
+run cheap and deterministic. Reading is incremental: a completed dream records, per session whose worker
+succeeded, the byte offset and record count its digest consumed (`session_marks`), so a long-lived
+session that keeps growing is read from that mark (the new records, plus up to 6 earlier user/assistant
+text records marked "already consolidated") instead of from byte 0, and a session that did not grow is
+not read at all. When no worker found anything, step 4 is skipped and the dream completes with an empty
+diff. Workers see a digest, not a raw transcript, and must cite a session id and
 a quote for every insight; the aggregator is told to add a memory only when a findings file backs it.
 
 ## 3. The review loop and dream lifecycle
@@ -120,7 +126,7 @@ wrapper injects `--dangerously-skip-permissions`, so dreamd refuses it and runs 
 flowchart TD
     N["03:30 launchd: dreamd dream --all"]
     N --> SW["sweep orphans<br/>(running rows whose lock pid is dead → failed)"]
-    SW --> P["per project: candidates since cutoff<br/>(14-day backfill if never dreamed)"]
+    SW --> P["per project: candidates with ≥ 8 KB unmined:<br/>marked sessions grown past their mark,<br/>unmarked ones newer than the cutoff<br/>(14-day backfill if never dreamed)"]
     P --> G1{"awaiting review?"}
     G1 -- yes --> SK1["skip"]
     G1 -- no --> G2{"≥ 24 h since cutoff<br/>and ≥ 3 sessions?"}
@@ -133,7 +139,8 @@ flowchart TD
 
 Measured on this machine, an uncapped first run would have mined 381 sessions. Under the defaults it
 mines 30 and touches the 3 or 4 most active projects, and because completion advances the cutoff and
-parks the project, the following nights only see new work.
+parks the project, the following nights only see new work: a session is a candidate again only when it
+grew by at least `min_transcript_bytes` past its mark, and then only that growth is read.
 
 ## 6. What was deliberately left out
 

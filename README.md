@@ -165,7 +165,8 @@ dreamd archive drm_...                        # or set it aside without applying
 ```
 
 `dream` options: `--force` (bypass the gate, including awaiting review, and
-the mined-through cutoff: candidates are windowed by the last apply only),
+the mined-through cutoff: candidates are windowed by the last apply only;
+session marks still apply, so a session with nothing new is not re-mined),
 `--model M` (aggregator model),
 `--instructions "..."` (appended to the aggregator prompt verbatim),
 `--sessions id,id` (explicit sessions; bypasses the gate and every cap),
@@ -180,20 +181,31 @@ applied; this is what the nightly job runs). `cancel <id>` cancels a pending or 
 What a dream does (state is saved to SQLite after each stage):
 
 0. **Discover.** A project is dreamable if its memory dir holds at least one
-   `.md`. Candidate sessions are `*.jsonl` of at least `min_transcript_bytes`,
-   newer than the project's mined-through cutoff (see The review loop; a
-   never-dreamed project: within the last `backfill_days`) and older than 10 minutes (a file touched in the last 10
-   minutes is a live session and is skipped), newest first, capped at 100.
-   The gate counts these. A dream mines the newest `max_sessions_per_dream`
-   of them; `--all` first plans the whole run (see Quota and caps).
+   `.md`. Candidate sessions are `*.jsonl` with at least
+   `min_transcript_bytes` of content not yet mined (see Only what changed):
+   a session a completed dream mined before qualifies when its file grew
+   past its mark; a session never mined qualifies when it is newer than the
+   project's mined-through cutoff (see The review loop; a never-dreamed
+   project: within the last `backfill_days`). Either way it must be older
+   than 10 minutes (a file touched in the last 10 minutes is a live session
+   and is skipped). Newest first, capped at 100. The gate counts these. A
+   dream mines the newest `max_sessions_per_dream` of them; `--all` first
+   plans the whole run (see Quota and caps).
 1. **Snapshot + clone** the memory dir into `in/` and `out/`; hash `in/`.
 2. **Reduce** each transcript in Rust (user/assistant text, tool names with a
-   short input preview, tool errors; images and noise dropped).
+   short input preview, tool errors; images and noise dropped). A session
+   mined before is read from its mark: only the new records, after up to 6
+   earlier user/assistant text records marked as already consolidated.
 3. **Workers** (fan-out, `concurrency` at a time): one `claude -p` per digest
    returning JSON findings: insights (each citing session id + a quote),
    stale files, corrections. A failed worker fails only its session; the
    dream fails if every worker fails.
-4. **Aggregator** edits `out/` (see Security model).
+4. **Aggregator** edits `out/` (see Security model). When every worker
+   returned no insights, stale files or corrections, it is not run: the
+   dream completes with an empty diff and `aggregate.md` = `Nothing to
+   consolidate: N session(s) mined, no new insights.`, and `dream` prints
+   `dream <id> completed: N sessions mined (X read), nothing to consolidate
+   (aggregator skipped)`.
 5. **Post-check** (fail closed): the live memory dir is unchanged, deletion
    manifest entries are valid, every new or edited `.md` has `name` and
    `description` frontmatter, every `MEMORY.md` link resolves, nothing outside
@@ -236,7 +248,13 @@ you instead of piling up more dreams:
   dream is running`, exit 3) and is idempotent. Archiving does not move the
   cutoff back: the archived dream's sessions stay mined.
 
-Upgrading from 0.1.0 adds the two columns on first open. A `completed` dream
+- **Session marks.** When a dream reaches `completed`, every session whose
+  worker succeeded is marked as mined through the bytes and records its
+  digest consumed (see Only what changed). A failed or timed-out session
+  keeps its old mark and is retried next time.
+
+Upgrading from 0.1.0 adds the new columns and the `session_marks` table on
+first open; sessions without a mark are read whole once. A `completed` dream
 made by 0.1.0 parks its project until you apply or archive it.
 
 Data lives in `~/.local/share/dreamd/`: `dreamd.db`, and per dream
@@ -268,9 +286,10 @@ sessions**, 91 of them in one project; at roughly **$0.40 of subscription
 quota per worker call** that is about $150 of quota in one night. The
 `[limits]` caps keep each run bounded:
 
-- `min_transcript_bytes` (8192) drops tiny transcripts (aborted or one-line
-  sessions) before anything else, so they neither count toward the gate nor
-  get mined.
+- `min_transcript_bytes` (8192) drops sessions with less than that much new
+  content (tiny, aborted or one-line sessions, or a long session that only
+  grew a little) before anything else, so they neither count toward the gate
+  nor get mined.
 - `backfill_days` (14): a project that has never been dreamed only considers
   the last two weeks; after its first completed dream the cutoff is the
   mined-through time (the later of the last completed dream and the last
@@ -285,11 +304,28 @@ quota per worker call** that is about $150 of quota in one night. The
   that gets nothing prints `deferred <slug>: run budget exhausted (N
   candidates)`; it is first in line on a later night if it stays active.
 
+**Only what changed.** Selection and reading are per session, by content,
+not by file mtime. dreamd keeps a mark per session (`session_marks`: bytes
+and JSONL records mined through), written when a dream completes for every
+session whose worker succeeded. A long-lived session that keeps growing is
+a candidate again only when it grew past its mark by at least
+`min_transcript_bytes`, and then only the new records are read: the digest
+starts with up to 6 earlier user/assistant text records under `# earlier
+context (already consolidated — do not re-report)`, then the new part, and
+the worker is told to mine only the new part. So a session is never re-read
+from byte 0 night after night, and the `max_transcript_bytes` head + tail
+cap applies to the new part instead of dropping the middle of the whole
+session. A file that shrank below its mark (truncated or rewritten) is read
+whole again, with a warning. When no worker found anything, the aggregator
+call is skipped too. `dream` prints the bytes read (`N sessions mined (12KB
+read)`), `show` prints `bytes read` per session, and `scan` prints the
+unmined bytes per project (`new=1.2MB`; `new_bytes` in `scan --json`).
+
 So a nightly run is at most 30 worker calls plus 5 aggregator calls. Check
 the plan before it runs:
 
 ```sh
-dreamd scan                     # per project: sessions=<candidates>  selected=<a dream would mine>
+dreamd scan                     # per project: sessions=<candidates>  selected=<a dream would mine>  new=<unmined bytes>
                                 # footer: next --all run: P projects, S worker calls (caps: …)
 dreamd dream --all --dry-run    # plan <slug>: k of n sessions / deferred / skipped, then
                                 # plan: P projects, S worker calls, P aggregator calls
@@ -303,7 +339,8 @@ dreamd dream <slug> --since-days 0 --max-sessions 100 --dry-run   # see what it 
 dreamd dream <slug> --since-days 0 --max-sessions 100
 ```
 
-`--since-days 0` removes the window (and the mined-through cutoff) for that run;
+`--since-days 0` removes the window (and the mined-through cutoff) for that run
+(sessions already mined through their end stay skipped);
 100 is the hosted-API ceiling, the most one dream can take. `--sessions
 id,id` picks exact transcripts and bypasses every cap.
 
