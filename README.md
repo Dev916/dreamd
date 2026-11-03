@@ -71,6 +71,13 @@ timeout_secs = 1800
 hour       = 3
 minute     = 30
 auto_apply = false
+
+[limits]                            # quota caps (see "Quota and caps")
+max_sessions_per_dream = 10         # newest candidate sessions one dream mines
+max_sessions_per_run   = 30         # worker calls one `dream --all` may spend
+max_projects_per_run   = 5          # projects one `dream --all` may dream
+backfill_days          = 14         # never-dreamed project: only transcripts this recent (0 = all)
+min_transcript_bytes   = 8192       # smaller transcripts are never candidates
 ```
 
 `config_dirs` and `data_dir` expand a leading `~`; **`claude_bin` does not**,
@@ -142,7 +149,8 @@ ok   last dream         none yet
 ```sh
 dreamd scan                                   # dreamable projects, candidate sessions, gate verdict
 dreamd dream -Users-webmech-dev-Tinkering     # by slug, or by the project's cwd
-dreamd dream ~/dev/Tinkering --dry-run        # what would be mined, no model calls
+dreamd dream ~/dev/Tinkering --dry-run        # the plan: sessions to mine, no model calls
+dreamd dream --all --dry-run                  # tonight's plan across every project
 dreamd list                                   # all dreams, newest first
 dreamd show drm_...                           # status, usage/cost, per-session results, summary
 dreamd summary drm_...                        # the aggregator's summary (aggregate.md)
@@ -153,18 +161,24 @@ dreamd rollback drm_...                       # restore the backup
 
 `dream` options: `--force` (bypass the gate), `--model M` (aggregator model),
 `--instructions "..."` (appended to the aggregator prompt verbatim),
-`--sessions id,id` (explicit sessions; bypasses the gate), `--dry-run`,
-`--all` (every dreamable project, gate applied per project; this is what the
-nightly job runs). `cancel <id>` cancels a pending or running dream.
+`--sessions id,id` (explicit sessions; bypasses the gate and every cap),
+`--max-sessions N` (overrides `max_sessions_per_dream`), `--since-days N`
+(only transcripts modified in the last N days, replacing both the backfill
+window and the last-dream cutoff; `0` = no window), `--dry-run` (print the
+plan and run nothing), `--all` (every dreamable project, gate and run caps
+applied; this is what the nightly job runs). `cancel <id>` cancels a pending or running dream.
 `--json` works on the read commands (`scan`, `list`, `show`, `doctor`,
 `schedule status`).
 
 What a dream does (state is saved to SQLite after each stage):
 
 0. **Discover.** A project is dreamable if its memory dir holds at least one
-   `.md`. Candidate sessions are `*.jsonl` newer than the last dream and older
-   than 10 minutes (a file touched in the last 10 minutes is a live session
-   and is skipped), newest first, capped at 100.
+   `.md`. Candidate sessions are `*.jsonl` of at least `min_transcript_bytes`,
+   newer than the last dream (a never-dreamed project: within the last
+   `backfill_days`) and older than 10 minutes (a file touched in the last 10
+   minutes is a live session and is skipped), newest first, capped at 100.
+   The gate counts these. A dream mines the newest `max_sessions_per_dream`
+   of them; `--all` first plans the whole run (see Quota and caps).
 1. **Snapshot + clone** the memory dir into `in/` and `out/`; hash `in/`.
 2. **Reduce** each transcript in Rust (user/assistant text, tool names with a
    short input preview, tool errors; images and noise dropped).
@@ -205,6 +219,49 @@ killed, e.g. a `serve` stopped mid-dream) is marked `failed` with
 `orphaned: owning process died`; this sweep runs when `serve` starts and
 before `dream`, `list`, `scan`, `cancel` and `doctor` (stderr:
 `swept orphaned dream <id>`).
+
+## Quota and caps
+
+Every mined session is one `claude -p` worker call, and every dream adds one
+aggregator call. Measured on a real machine (13 projects, a few months of
+history), an uncapped first `dreamd dream --all` would have mined **381
+sessions**, 91 of them in one project; at roughly **$0.40 of subscription
+quota per worker call** that is about $150 of quota in one night. The
+`[limits]` caps keep each run bounded:
+
+- `min_transcript_bytes` (8192) drops tiny transcripts (aborted or one-line
+  sessions) before anything else, so they neither count toward the gate nor
+  get mined.
+- `backfill_days` (14): a project that has never been dreamed only considers
+  the last two weeks; after its first dream the cutoff is the last dream.
+- `max_sessions_per_dream` (10): a dream mines the newest 10 candidates.
+- `max_projects_per_run` (5) and `max_sessions_per_run` (30): `dream --all`
+  orders due projects by their newest candidate (most recently active first)
+  and hands out sessions newest-first until either budget is spent. A project
+  that gets nothing prints `deferred <slug>: run budget exhausted (N
+  candidates)`; it is first in line on a later night if it stays active.
+
+So a nightly run is at most 30 worker calls plus 5 aggregator calls. Check
+the plan before it runs:
+
+```sh
+dreamd scan                     # per project: sessions=<candidates>  selected=<a dream would mine>
+                                # footer: next --all run: P projects, S worker calls (caps: …)
+dreamd dream --all --dry-run    # plan <slug>: k of n sessions / deferred / skipped, then
+                                # plan: P projects, S worker calls, P aggregator calls
+```
+
+**Backfilling deliberately.** To mine older history, do it one project at a
+time, when you choose to spend the quota:
+
+```sh
+dreamd dream <slug> --since-days 0 --max-sessions 100 --dry-run   # see what it would cost
+dreamd dream <slug> --since-days 0 --max-sessions 100
+```
+
+`--since-days 0` removes the window (and the last-dream cutoff) for that run;
+100 is the hosted-API ceiling, the most one dream can take. `--sessions
+id,id` picks exact transcripts and bypasses every cap.
 
 ## HTTP API
 

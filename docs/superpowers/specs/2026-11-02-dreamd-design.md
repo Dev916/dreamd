@@ -62,6 +62,9 @@ model = "sonnet"; effort = "low"; concurrency = 3; timeout_secs = 600; max_trans
 model = "opus"; effort = "high"; timeout_secs = 1800
 [schedule]
 hour = 3; minute = 30; auto_apply = false
+[limits]   # quota caps: each mined session is one `claude -p` call (~$0.40 of quota)
+max_sessions_per_dream = 10; max_sessions_per_run = 30; max_projects_per_run = 5
+backfill_days = 14; min_transcript_bytes = 8192
 ```
 
 ### Dream object (mirrors the hosted API)
@@ -70,7 +73,7 @@ hour = 3; minute = 30; auto_apply = false
 
 ### Pipeline (`dreamd dream <selector>`)
 
-0. **Discover.** Walk each config dir's `projects/*/`; a project is dreamable if it has a memory dir with ≥1 `.md`. Candidate sessions = `*.jsonl` whose mtime > project's `last_dreamed_at` (or all if never) and mtime older than 10 min (skip live sessions). Gate: skip unless `--force` or (hours since last ≥ min_hours and candidate count ≥ min_sessions). Cap at 100 sessions, newest first (matches hosted limit).
+0. **Discover and plan.** Walk each config dir's `projects/*/`; a project is dreamable if it has a memory dir with ≥1 `.md`. Candidate sessions = `*.jsonl` of ≥ `min_transcript_bytes` whose mtime > project's `last_dreamed_at` (never dreamed: within the last `backfill_days`, 0 = all; `--since-days N` replaces both for one run) and mtime older than 10 min (skip live sessions), newest first, capped at 100 (matches hosted limit). Gate: skip unless `--force` or (hours since last ≥ min_hours and candidate count ≥ min_sessions). A dream mines the newest `max_sessions_per_dream` (`--max-sessions N`) candidates; explicit `--sessions` bypasses every cap. `--all` plans first: due projects ordered by newest candidate mtime, at most `max_projects_per_run`, sessions allocated newest-first until `max_sessions_per_run` is spent (a project may get fewer than the per-dream cap); a due project left with nothing prints `deferred <slug>: run budget exhausted (N candidates)` and counts as skipped. `--dry-run` prints the plan (`plan <slug>: k of n sessions`, deferred/skipped lines, `plan: P projects, S worker calls, P aggregator calls`) and runs nothing (exit 2 if empty). Measured motivation: an uncapped first `--all` on the author's machine would mine 381 sessions across 13 projects (91 in one).
 1. **Snapshot + clone.** Copy memory dir → `in/` and `out/`. Record a content hash of `in/`.
 2. **Reduce transcripts (Rust, no model).** For each session JSONL: keep user text, assistant text, tool_use `name` + a 200-char input preview, tool_result error text; drop images/base64, progress, system noise. Emit a compact text digest. If it exceeds `max_transcript_bytes`, keep head 40% + tail 40% with a `[... elided N bytes ...]` marker.
 3. **Fan-out workers.** For each digest, run one `claude -p` with `--json-schema` (findings schema below), `--permission-mode plan` (no tools needed; digest is inlined in the prompt), model/effort from `[worker]`, bounded by a tokio semaphore (`concurrency`) and `tokio::time::timeout`. Prompt gives: the project's `MEMORY.md` index (so it knows what exists), the digest, and the four memory types. A failed or timed-out worker is recorded per session and does not fail the dream unless *all* workers fail.
@@ -103,8 +106,8 @@ One dream per project at a time. `prepare` takes `<data_dir>/locks/<sha256(proje
 ### CLI
 
 ```
-dreamd scan [--all-dirs]                 # projects, sessions since last dream, gate verdict
-dreamd dream <slug|cwd|--all> [--force] [--model M] [--instructions "…"] [--sessions id,id] [--dry-run]
+dreamd scan [--all-dirs]                 # projects, sessions + selected, gate verdict, next --all plan
+dreamd dream <slug|cwd|--all> [--force] [--model M] [--instructions "…"] [--sessions id,id] [--since-days N] [--max-sessions N] [--dry-run]
 dreamd list | show <id> | diff <id> | summary <id> | cancel <id>
 dreamd apply <id> [--force] | rollback <id>
 dreamd serve [--port 7720]
