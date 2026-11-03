@@ -23,7 +23,9 @@ use crate::db::Db;
 use crate::discover::{candidate_sessions, gate, DiscoveredProject, Gate};
 use crate::fsops::{copy_dir, hash_dir, unified_diff};
 use crate::lock::{LockError, ProjectLock};
-use crate::model::{Dream, DreamStatus, SessionFile, SessionRecord, SessionStatus, Usage};
+use crate::model::{
+    DiffStats, Dream, DreamStatus, SessionFile, SessionMark, SessionRecord, SessionStatus, Usage,
+};
 use crate::notify::notify;
 use crate::postcheck::{apply_delete_manifest, check, check_escapes, snapshot_mtimes};
 use crate::{transcript, worker};
@@ -133,7 +135,13 @@ fn select_sessions(
         Some(ids) => {
             let project_dir = d.project.config_dir.join("projects").join(&d.project.slug);
             // Explicit ids bypass every cap (window, size, count).
-            let all = candidate_sessions(&project_dir, None, Utc::now(), 0);
+            let all = candidate_sessions(
+                &project_dir,
+                None,
+                Utc::now(),
+                0,
+                &std::collections::HashMap::new(),
+            );
             let missing: Vec<&str> = ids
                 .iter()
                 .filter(|id| !all.iter().any(|s| &s.id == *id))
@@ -209,7 +217,7 @@ pub fn prepare(ctx: &Ctx, d: &DiscoveredProject, opts: &DreamOpts) -> anyhow::Re
             sessions.len()
         );
         for s in &sessions {
-            match transcript::reduce(&s.path, ctx.cfg.worker.max_transcript_bytes) {
+            match reduce_session(&s.path, s.mark, ctx.cfg.worker.max_transcript_bytes) {
                 Ok(dg) => println!(
                     "  {}  {} → {} bytes{}",
                     s.id,
@@ -274,6 +282,7 @@ pub async fn execute(ctx: &Ctx, prepared: PreparedDream, opts: DreamOpts) -> any
         .config_dir
         .join("projects")
         .join(&dream.project.slug);
+    let marks = ctx.db.session_marks(&dream.project)?;
     let sessions: Vec<SessionFile> = dream
         .session_ids
         .iter()
@@ -287,20 +296,33 @@ pub async fn execute(ctx: &Ctx, prepared: PreparedDream, opts: DreamOpts) -> any
                 id: sid.clone(),
                 path,
                 mtime,
+                new_bytes: 0,
+                mark: marks.get(sid).copied(),
             }
         })
         .collect();
     let model = dream.model.clone();
 
     let mut usage = Usage::default();
-    let res = pipeline(ctx, &dream, &dir, &sessions, &opts, &model, &mut usage).await;
+    let mut mined = Vec::new();
+    let res = pipeline(
+        ctx, &dream, &dir, &sessions, &opts, &model, &mut usage, &mut mined,
+    )
+    .await;
     let _ = ctx.db.set_pid(&id, None);
     match res {
         Ok(Stop::Completed) => {
             ctx.db.update_status(&id, DreamStatus::Completed, None)?;
             // Its sessions are mined: later dreams start after them, applied
-            // or not (failed/canceled dreams leave the cutoff alone).
-            ctx.db.set_last_mined_at(&dream.project, Utc::now())?;
+            // or not (failed/canceled dreams leave the cutoff alone). Only
+            // sessions whose worker succeeded advance their mark, so a
+            // failed or timed-out one is retried from its old mark.
+            let now = Utc::now();
+            ctx.db.set_last_mined_at(&dream.project, now)?;
+            for m in &mined {
+                ctx.db
+                    .set_session_mark(&dream.project, &m.0, m.1, m.2, now)?;
+            }
         }
         Ok(Stop::Canceled) => {}
         Err(e) => {
@@ -334,6 +356,44 @@ pub async fn execute(ctx: &Ctx, prepared: PreparedDream, opts: DreamOpts) -> any
     Ok(done)
 }
 
+/// Reduce one session from its mark (a delta digest with earlier context),
+/// or whole when it has no mark or did not grow past it (an explicit
+/// re-mine).
+pub fn reduce_session(
+    path: &Path,
+    mark: Option<SessionMark>,
+    max_bytes: usize,
+) -> anyhow::Result<transcript::Digest> {
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    match mark {
+        Some(m) if m.mined_through_records > 0 && len != m.mined_through_bytes => {
+            transcript::reduce_from(
+                path,
+                m.mined_through_bytes,
+                m.mined_through_records,
+                transcript::OVERLAP_RECORDS,
+                max_bytes,
+            )
+        }
+        _ => transcript::reduce(path, max_bytes),
+    }
+}
+
+/// `aggregate.md` / summary prefix of a dream whose workers found nothing.
+pub const NOTHING_TO_CONSOLIDATE: &str = "Nothing to consolidate:";
+
+/// The dream completed without running the aggregator (no findings).
+pub fn aggregator_skipped(d: &Dream) -> bool {
+    d.summary
+        .as_deref()
+        .is_some_and(|s| s.starts_with(NOTHING_TO_CONSOLIDATE))
+}
+
+/// `(session id, consumed bytes, consumed records)` of a successfully mined
+/// session: its mark once the dream completes.
+type Mined = (String, u64, usize);
+
+#[allow(clippy::too_many_arguments)]
 async fn pipeline(
     ctx: &Ctx,
     dream: &Dream,
@@ -342,6 +402,7 @@ async fn pipeline(
     opts: &DreamOpts,
     model: &str,
     usage: &mut Usage,
+    mined: &mut Vec<Mined>,
 ) -> anyhow::Result<Stop> {
     let id = dream.id.as_str();
     let db = &ctx.db;
@@ -368,13 +429,20 @@ async fn pipeline(
 
     // 2. Reduce transcripts.
     let mut digests = Vec::new();
-    let mut paths = Vec::new();
+    let mut read = Vec::new();
     let mut unreadable = Vec::new();
     for s in sessions {
-        match transcript::reduce(&s.path, ctx.cfg.worker.max_transcript_bytes) {
+        match reduce_session(&s.path, s.mark, ctx.cfg.worker.max_transcript_bytes) {
             Ok(dg) => {
-                db.insert_session(id, &pending_record(&s.id, &s.path))?;
-                paths.push(s.path.clone());
+                let mut r = pending_record(&s.id, &s.path);
+                r.bytes_read = dg.bytes_in as u64;
+                db.insert_session(id, &r)?;
+                read.push((
+                    s.path.clone(),
+                    dg.bytes_in as u64,
+                    dg.consumed_bytes,
+                    dg.consumed_records,
+                ));
                 digests.push(dg);
             }
             Err(e) => {
@@ -400,10 +468,14 @@ async fn pipeline(
         &dir.join("findings"),
     )
     .await;
-    for (o, p) in outcomes.iter_mut().zip(paths) {
-        o.record.transcript_path = p;
+    for (o, (path, bytes_in, through_bytes, through_records)) in outcomes.iter_mut().zip(read) {
+        o.record.transcript_path = path;
+        o.record.bytes_read = bytes_in;
         *usage += o.record.usage;
         db.update_session(id, &o.record)?;
+        if o.record.status == SessionStatus::Ok {
+            mined.push((o.record.session_id.clone(), through_bytes, through_records));
+        }
     }
     let ok = outcomes
         .iter()
@@ -417,6 +489,23 @@ async fn pipeline(
     }
     if canceled(ctx, id)? {
         return Ok(Stop::Canceled);
+    }
+
+    // 3b. Nothing found: skip the aggregator, out/ stays a clean clone.
+    if outcomes
+        .iter()
+        .filter(|o| o.record.status == SessionStatus::Ok)
+        .all(|o| o.findings.as_ref().is_none_or(|f| f.is_empty()))
+    {
+        let summary = format!("{NOTHING_TO_CONSOLIDATE} {ok} session(s) mined, no new insights.");
+        std::fs::write(dir.join("dream.diff"), "").context("write dream.diff")?;
+        std::fs::write(dir.join("aggregate.md"), format!("{summary}\n"))
+            .context("write aggregate.md")?;
+        db.set_result(id, usage, &summary, &DiffStats::default())?;
+        if canceled(ctx, id)? {
+            return Ok(Stop::Canceled);
+        }
+        return Ok(Stop::Completed);
     }
 
     // 4. Aggregate. Project context is copied into the dream dir first (the
@@ -524,6 +613,7 @@ fn pending_record(sid: &str, path: &Path) -> SessionRecord {
         usage: Usage::default(),
         error: None,
         duration_ms: 0,
+        bytes_read: 0,
     }
 }
 
@@ -582,6 +672,11 @@ pub fn archive(db: &Db, id: &str) -> Result<Dream, ArchiveError> {
     db.get_dream(id)
         .map_err(ArchiveError::Db)?
         .ok_or(ArchiveError::NotFound)
+}
+
+/// Transcript bytes the dream's digests read (all sessions).
+pub fn bytes_read(db: &Db, id: &str) -> anyhow::Result<u64> {
+    Ok(db.list_sessions(id)?.iter().map(|s| s.bytes_read).sum())
 }
 
 /// Number of sessions that mined successfully.

@@ -17,6 +17,7 @@
 #   badjson     prints `not json`
 # Extras:
 #   DREAMD_STUB_FAIL_SESSION=<id>  worker mode fails (like `fail`) for that session id
+#   DREAMD_STUB_EMPTY_FINDINGS=1   worker mode returns empty insights/stale/corrections
 #   DREAMD_STUB_PROMPT_OUT=<path>  write the received prompt there (every mode)
 #   DREAMD_STUB_ARGV_OUT=<path>    append the received argv (one arg per line, then a blank line)
 #   The init event reports permissionMode = the --permission-mode received
@@ -105,6 +106,11 @@ case "$mode" in
     session=$(printf '%s\n' "$prompt" | sed -n 's/^.*session id:[[:space:]]*\([^[:space:]]*\).*$/\1/p' | head -n 1)
     if [ -n "${DREAMD_STUB_FAIL_SESSION:-}" ] && [ "$session" = "$DREAMD_STUB_FAIL_SESSION" ]; then
       fail
+    fi
+    if [ "${DREAMD_STUB_EMPTY_FINDINGS:-}" = 1 ]; then
+      findings='{"insights":[],"stale":[],"corrections":[]}'
+      emit "$findings" false "$findings"
+      exit 0
     fi
     findings=$(printf '{"insights":[{"kind":"project","statement":"stub insight","why":"stub","evidence":{"session_id":%s,"quote":"stub"},"confidence":0.9,"relates_to":[]}],"stale":[],"corrections":[]}' "$(json_str "$session")")
     emit "$findings" false "$findings"

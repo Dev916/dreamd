@@ -109,10 +109,13 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                 if !sessions.is_empty() {
                     println!("\nsessions:");
                     for r in &sessions {
+                        let read = discover::human_bytes(r.bytes_read);
                         match &r.error {
-                            Some(e) => println!("  {}  {}  {e}", r.session_id, r.status),
+                            Some(e) => {
+                                println!("  {}  {}  bytes read {read}  {e}", r.session_id, r.status)
+                            }
                             None => println!(
-                                "  {}  {}  {}ms  cost_usd={:.4}",
+                                "  {}  {}  {}ms  bytes read {read}  cost_usd={:.4}",
                                 r.session_id, r.status, r.duration_ms, r.usage.cost_usd
                             ),
                         }
@@ -340,6 +343,7 @@ async fn mine(
                 usage: model::Usage::default(),
                 error: Some(format!("{e:#}")),
                 duration_ms: 0,
+                bytes_read: 0,
             },
             findings: None,
         });
@@ -483,14 +487,19 @@ async fn dream_cmd(
                 DreamStatus::Completed => {
                     completed += 1;
                     let s = dr.diff_stats.unwrap_or_default();
-                    println!(
-                        "dream {} completed: {} sessions mined, +{} -{} ~{} files",
-                        dr.id,
-                        dream::sessions_mined(&ctx.db, &dr.id)?,
-                        s.files_added,
-                        s.files_removed,
-                        s.files_changed
-                    );
+                    let n = dream::sessions_mined(&ctx.db, &dr.id)?;
+                    let read = discover::human_bytes(dream::bytes_read(&ctx.db, &dr.id)?);
+                    if dream::aggregator_skipped(&dr) {
+                        println!(
+                            "dream {} completed: {n} sessions mined ({read} read), nothing to consolidate (aggregator skipped)",
+                            dr.id
+                        );
+                    } else {
+                        println!(
+                            "dream {} completed: {n} sessions mined ({read} read), +{} -{} ~{} files",
+                            dr.id, s.files_added, s.files_removed, s.files_changed
+                        );
+                    }
                     println!("{}", dr.output_dir.display());
                     if auto_apply {
                         match apply::apply(&ctx, &dr.id, false) {
@@ -539,6 +548,7 @@ fn print_plan(ctx: &dream::Ctx, plan: &discover::RunPlan, explicit: Option<&[Str
     for item in &plan.items {
         match item {
             discover::PlanItem::Run { project, take } => {
+                let marks = ctx.db.session_marks(&project.project).unwrap_or_default();
                 let sessions: Vec<std::path::PathBuf> = match explicit {
                     Some(ids) => {
                         let dir = project
@@ -565,7 +575,8 @@ fn print_plan(ctx: &dream::Ctx, plan: &discover::RunPlan, explicit: Option<&[Str
                 println!("plan {}: {take} of {n} sessions", project.project.slug);
                 for p in sessions {
                     let id = p.file_stem().unwrap_or_default().to_string_lossy();
-                    match transcript::reduce(&p, ctx.cfg.worker.max_transcript_bytes) {
+                    let mark = marks.get(id.as_ref()).copied();
+                    match dream::reduce_session(&p, mark, ctx.cfg.worker.max_transcript_bytes) {
                         Ok(dg) => println!(
                             "  {id}  {} → {} bytes{}",
                             dg.bytes_in,

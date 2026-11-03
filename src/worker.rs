@@ -21,6 +21,9 @@ const TIMEOUT_GRACE: Duration = Duration::from_secs(2);
 /// Workers need no tools: the digest is inlined in the prompt.
 pub const WORKER_PERMISSION_MODE: &str = "plan";
 
+/// Prompt paragraph for a delta digest (a session mined before that grew).
+pub const DELTA_NOTE: &str = "This session was mined before and has grown since. The digest holds only the new part, under `# new since the last dream`; the lines under `# earlier context` were already consolidated and are there for continuity only. Mine only the new part: never report an insight, stale entry or correction whose evidence is in the earlier context.\n\n";
+
 /// The worker prompt for one session digest.
 pub fn worker_prompt(memory_index: &str, digest: &Digest) -> String {
     let index = if memory_index.trim().is_empty() {
@@ -37,7 +40,7 @@ Memory kinds (use exactly one per insight):\n\
 - project: facts about the project itself (layout, conventions, decisions, ongoing work).\n\
 - reference: pointers to external resources (URLs, docs, dashboards, tickets).\n\
 \n\
-Rules:\n\
+{scope}Rules:\n\
 - Every insight, stale entry and correction MUST cite evidence: this session id and a verbatim quote from the transcript below. No quote, no finding.\n\
 - Insights only; do not restate the memory index. Report only what this session adds, contradicts (corrections) or shows to be out of date (stale).\n\
 - Skip ephemeral task chatter that will not matter in a future session.\n\
@@ -53,6 +56,7 @@ session id: {sid}\n\
 {digest}\n",
         sid = digest.session_id,
         digest = digest.text,
+        scope = if digest.delta { DELTA_NOTE } else { "" },
     )
 }
 
@@ -139,6 +143,7 @@ fn failed(sid: &str, error: String, duration_ms: u64) -> SessionOutcome {
             usage: Usage::default(),
             error: Some(error),
             duration_ms,
+            bytes_read: 0,
         },
         findings: None,
     }
@@ -201,6 +206,7 @@ fn finish(
             usage: r.usage,
             error: None,
             duration_ms,
+            bytes_read: 0,
         },
         findings: Some(findings),
     }
@@ -249,6 +255,10 @@ mod tests {
         assert!(sid_at < digest_at);
         assert!(p.contains(&d.text));
         assert!(worker_prompt("", &d).contains("no memories yet"));
+        assert!(!p.contains("Mine only the new part"));
+        let mut delta = d.clone();
+        delta.delta = true;
+        assert!(worker_prompt("", &delta).contains(DELTA_NOTE));
     }
 
     /// Fake runner keyed on the session id in the prompt.

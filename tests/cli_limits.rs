@@ -96,8 +96,8 @@ fn per_dream_cap_selects_newest_and_max_sessions_overrides() {
     let s = out(&a);
     assert!(s.contains("completed: 4 sessions mined"), "{s}");
     let id = dream_id(&s);
-    // s1..s3 share an mtime; ties break by id.
-    assert_eq!(shown_sessions(&f, &id), vec!["s1", "s4", "s5", "s6"]);
+    // s5 and s6 are mined through (marked), so the remaining four go.
+    assert_eq!(shown_sessions(&f, &id), vec!["s1", "s2", "s3", "s4"]);
     assert_eq!(findings_count(&f, &id), 4);
 }
 

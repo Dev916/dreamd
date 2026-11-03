@@ -62,7 +62,8 @@ fn forced_dream_completes_and_leaves_live_memory_untouched() {
         .clone();
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
-        stdout.contains("completed: 3 sessions mined, +1 -0 ~1 files"),
+        stdout.contains("completed: 3 sessions mined (")
+            && stdout.contains("KB read), +1 -0 ~1 files"),
         "{stdout}"
     );
     let id = dream_id(&stdout);

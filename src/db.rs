@@ -12,6 +12,8 @@ use anyhow::{anyhow, Context};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
+use std::collections::HashMap;
+
 use crate::model::*;
 
 const SCHEMA: &str = r#"
@@ -53,6 +55,14 @@ CREATE TABLE IF NOT EXISTS dream_sessions (
     duration_ms     INTEGER NOT NULL,
     PRIMARY KEY (dream_id, session_id)
 );
+CREATE TABLE IF NOT EXISTS session_marks (
+    session_id            TEXT NOT NULL,
+    project_key           TEXT NOT NULL,
+    mined_through_bytes   INTEGER NOT NULL,
+    mined_through_records INTEGER NOT NULL,
+    updated_at            TEXT NOT NULL,
+    PRIMARY KEY (session_id, project_key)
+);
 CREATE TABLE IF NOT EXISTS applies (
     dream_id    TEXT PRIMARY KEY,
     applied_at  TEXT NOT NULL,
@@ -69,6 +79,7 @@ const DREAM_COLS: &str = "d.id, d.status, d.model, d.instructions, d.session_ids
 const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("projects", "last_mined_at", "TEXT"),
     ("dreams", "archived_at", "TEXT"),
+    ("dream_sessions", "bytes_read", "INTEGER"),
 ];
 
 /// The dreamd database. `Send + Sync`; every call takes the connection lock.
@@ -137,6 +148,7 @@ fn row_to_session(r: &Row<'_>) -> anyhow::Result<SessionRecord> {
     let findings_path: Option<String> = r.get(3)?;
     let usage: String = r.get(4)?;
     let duration_ms: i64 = r.get(6)?;
+    let bytes_read: Option<i64> = r.get(7)?;
     Ok(SessionRecord {
         session_id: r.get(0)?,
         transcript_path: transcript_path.into(),
@@ -145,6 +157,14 @@ fn row_to_session(r: &Row<'_>) -> anyhow::Result<SessionRecord> {
         usage: serde_json::from_str(&usage).context("usage_json")?,
         error: r.get(5)?,
         duration_ms: u64::try_from(duration_ms).context("duration_ms")?,
+        bytes_read: u64::try_from(bytes_read.unwrap_or(0)).context("bytes_read")?,
+    })
+}
+
+fn mark_from((bytes, records): (i64, i64)) -> anyhow::Result<SessionMark> {
+    Ok(SessionMark {
+        mined_through_bytes: u64::try_from(bytes).context("mined_through_bytes")?,
+        mined_through_records: usize::try_from(records).context("mined_through_records")?,
     })
 }
 
@@ -431,8 +451,8 @@ impl Db {
     pub fn insert_session(&self, dream_id: &str, s: &SessionRecord) -> anyhow::Result<()> {
         self.conn().execute(
             "INSERT INTO dream_sessions (dream_id, session_id, transcript_path, status,
-                 findings_path, usage_json, error, duration_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 findings_path, usage_json, error, duration_ms, bytes_read)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 dream_id,
                 s.session_id,
@@ -441,7 +461,8 @@ impl Db {
                 s.findings_path.as_deref().map(path_str),
                 serde_json::to_string(&s.usage)?,
                 s.error,
-                i64::try_from(s.duration_ms)?
+                i64::try_from(s.duration_ms)?,
+                i64::try_from(s.bytes_read)?
             ],
         )?;
         Ok(())
@@ -450,7 +471,7 @@ impl Db {
     pub fn update_session(&self, dream_id: &str, s: &SessionRecord) -> anyhow::Result<()> {
         let n = self.conn().execute(
             "UPDATE dream_sessions SET transcript_path = ?3, status = ?4, findings_path = ?5,
-                 usage_json = ?6, error = ?7, duration_ms = ?8
+                 usage_json = ?6, error = ?7, duration_ms = ?8, bytes_read = ?9
              WHERE dream_id = ?1 AND session_id = ?2",
             params![
                 dream_id,
@@ -460,7 +481,8 @@ impl Db {
                 s.findings_path.as_deref().map(path_str),
                 serde_json::to_string(&s.usage)?,
                 s.error,
-                i64::try_from(s.duration_ms)?
+                i64::try_from(s.duration_ms)?,
+                i64::try_from(s.bytes_read)?
             ],
         )?;
         expect_one(n, "session", &format!("{dream_id}/{}", s.session_id))
@@ -471,7 +493,7 @@ impl Db {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT session_id, transcript_path, status, findings_path, usage_json, error,
-                 duration_ms
+                 duration_ms, bytes_read
              FROM dream_sessions WHERE dream_id = ?1 ORDER BY rowid",
         )?;
         let mut rows = stmt.query([dream_id])?;
@@ -480,6 +502,67 @@ impl Db {
             out.push(row_to_session(r)?);
         }
         Ok(out)
+    }
+
+    /// How far `session_id` of this project has been mined, if at all.
+    pub fn session_mark(
+        &self,
+        p: &Project,
+        session_id: &str,
+    ) -> anyhow::Result<Option<SessionMark>> {
+        let v: Option<(i64, i64)> = self
+            .conn()
+            .query_row(
+                "SELECT mined_through_bytes, mined_through_records FROM session_marks
+                 WHERE project_key = ?1 AND session_id = ?2",
+                params![p.key(), session_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        v.map(mark_from).transpose()
+    }
+
+    /// Every mark of this project, by session id.
+    pub fn session_marks(&self, p: &Project) -> anyhow::Result<HashMap<String, SessionMark>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT session_id, mined_through_bytes, mined_through_records FROM session_marks
+             WHERE project_key = ?1",
+        )?;
+        let mut rows = stmt.query([p.key()])?;
+        let mut out = HashMap::new();
+        while let Some(r) = rows.next()? {
+            out.insert(r.get(0)?, mark_from((r.get(1)?, r.get(2)?))?);
+        }
+        Ok(out)
+    }
+
+    /// Record that `session_id` is mined through `bytes` / `records`.
+    pub fn set_session_mark(
+        &self,
+        p: &Project,
+        session_id: &str,
+        bytes: u64,
+        records: usize,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        self.conn().execute(
+            "INSERT INTO session_marks (session_id, project_key, mined_through_bytes,
+                 mined_through_records, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(session_id, project_key) DO UPDATE SET
+                 mined_through_bytes = excluded.mined_through_bytes,
+                 mined_through_records = excluded.mined_through_records,
+                 updated_at = excluded.updated_at",
+            params![
+                session_id,
+                p.key(),
+                i64::try_from(bytes)?,
+                i64::try_from(records)?,
+                ts(now)
+            ],
+        )?;
+        Ok(())
     }
 
     /// Record (or replace) the backup taken when a dream was applied.
@@ -628,6 +711,7 @@ mod tests {
             usage: Usage::default(),
             error: None,
             duration_ms: 0,
+            bytes_read: 0,
         };
         let s2 = SessionRecord {
             session_id: "s2".into(),
@@ -643,6 +727,7 @@ mod tests {
             cost_usd: 0.01,
         };
         s1.duration_ms = 1234;
+        s1.bytes_read = 4096;
         db.update_session(&d.id, &s1).unwrap();
         assert_eq!(db.list_sessions(&d.id).unwrap(), vec![s1, s2]);
         assert!(db.list_sessions("drm_other").unwrap().is_empty());
@@ -752,7 +837,13 @@ mod tests {
             let old = SCHEMA
                 .replace(",\n    last_mined_at   TEXT", "")
                 .replace(",\n    archived_at      TEXT", "");
+            let marks_at = old
+                .find("CREATE TABLE IF NOT EXISTS session_marks")
+                .unwrap();
+            let marks_end = marks_at + old[marks_at..].find(");\n").unwrap() + 3;
+            let old = format!("{}{}", &old[..marks_at], &old[marks_end..]);
             assert!(!old.contains("last_mined_at") && !old.contains("archived_at"));
+            assert!(!old.contains("session_marks") && !old.contains("bytes_read"));
             c.execute_batch(&old).unwrap();
         }
         let db = Db::open(&path).unwrap();
@@ -760,10 +851,44 @@ mod tests {
         db.insert_dream(&d).unwrap();
         db.set_archived(&d.id, Utc::now()).unwrap();
         db.set_last_mined_at(&d.project, Utc::now()).unwrap();
+        assert!(db.session_marks(&d.project).unwrap().is_empty());
+        db.set_session_mark(&d.project, "s1", 10, 2, Utc::now())
+            .unwrap();
         drop(db);
         // Re-opening a migrated database is a no-op.
         let db = Db::open(&path).unwrap();
         assert!(db.get_dream(&d.id).unwrap().unwrap().archived_at.is_some());
+        assert_eq!(
+            db.session_mark(&d.project, "s1")
+                .unwrap()
+                .unwrap()
+                .mined_through_bytes,
+            10
+        );
+    }
+
+    #[test]
+    fn session_marks_upsert_per_project() {
+        let db = Db::open_memory().unwrap();
+        let (a, b) = (project("p1"), project("p2"));
+        assert_eq!(db.session_mark(&a, "s1").unwrap(), None);
+        let t = Utc::now();
+        db.set_session_mark(&a, "s1", 100, 3, t).unwrap();
+        db.set_session_mark(&a, "s2", 50, 1, t).unwrap();
+        db.set_session_mark(&b, "s1", 7, 1, t).unwrap();
+        db.set_session_mark(&a, "s1", 250, 9, t).unwrap();
+        let m = db.session_mark(&a, "s1").unwrap().unwrap();
+        assert_eq!(
+            m,
+            SessionMark {
+                mined_through_bytes: 250,
+                mined_through_records: 9
+            }
+        );
+        let all = db.session_marks(&a).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all["s2"].mined_through_bytes, 50);
+        assert_eq!(db.session_marks(&b).unwrap()["s1"].mined_through_records, 1);
     }
 
     #[test]

@@ -61,11 +61,15 @@ fn completed_dream_parks_project_until_archived() {
         "{}",
         out(&a)
     );
-    // --sessions bypasses the gate; --force bypasses it and the cutoff.
+    // --sessions bypasses the gate; --force bypasses it and the cutoff, but
+    // not the session marks: nothing grew, so nothing to mine.
     dream_cmd(&f)
         .args([SLUG, "--sessions", "s1", "--dry-run"])
         .assert()
         .code(0);
+    let a = dream_cmd(&f).args([SLUG, "--force"]).assert().code(2);
+    assert!(out(&a).contains("no candidate sessions"), "{}", out(&a));
+    common::append_turns(&f.project_dir.join("s1.jsonl"), "more", 9000);
     let a = dream_cmd(&f).args([SLUG, "--force"]).assert().code(0);
     let id2 = dream_id(&out(&a));
     assert_ne!(id, id2);

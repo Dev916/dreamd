@@ -1,6 +1,7 @@
 //! Discovery: walk config dirs for dreamable projects, pick candidate
 //! sessions, and decide (gate) whether a project is due for a dream.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
@@ -8,7 +9,7 @@ use serde::Serialize;
 
 use crate::config::{expand_tilde, Config};
 use crate::db::Db;
-use crate::model::{Project, SessionFile};
+use crate::model::{Project, SessionFile, SessionMark};
 
 /// A session modified more recently than this is considered live.
 pub const LIVE_WINDOW_MINUTES: i64 = 10;
@@ -28,6 +29,8 @@ pub struct DiscoveredProject {
     pub hours_since: Option<f64>,
     /// A `completed`, unarchived dream that still awaits review.
     pub awaiting_review: Option<String>,
+    /// Unmined bytes across all candidate sessions.
+    pub new_bytes_total: u64,
 }
 
 impl DiscoveredProject {
@@ -64,6 +67,8 @@ pub struct ScanRow {
     pub candidate_sessions: usize,
     /// Sessions a single dream would mine under the current caps.
     pub selected_sessions: usize,
+    /// Unmined bytes across all candidate sessions.
+    pub new_bytes: u64,
     pub last_dreamed_at: Option<DateTime<Utc>>,
     pub last_mined_at: Option<DateTime<Utc>>,
     pub verdict: String,
@@ -81,6 +86,7 @@ impl ScanRow {
                 .candidate_sessions
                 .len()
                 .min(cfg.limits.max_sessions_per_dream),
+            new_bytes: d.new_bytes_total,
             last_dreamed_at: d.last_dreamed_at,
             last_mined_at: d.last_mined_at,
             verdict: gate(d, cfg, false).to_string(),
@@ -95,14 +101,30 @@ impl ScanRow {
             .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
             .unwrap_or_else(|| "never".into());
         format!(
-            "{}  sessions={}  selected={}  last={}  verdict={}  dir={}",
+            "{}  sessions={}  selected={}  new={}  last={}  verdict={}  dir={}",
             self.slug,
             self.candidate_sessions,
             self.selected_sessions,
+            human_bytes(self.new_bytes),
             last,
             self.verdict,
             self.config_dir.display()
         )
+    }
+}
+
+/// `48KB`, `1.2MB`: binary units, whole bytes and KB, one decimal above.
+pub fn human_bytes(n: u64) -> String {
+    const K: f64 = 1024.0;
+    let f = n as f64;
+    if n < 1024 {
+        format!("{n}B")
+    } else if f < K * K {
+        format!("{}KB", (f / K).round() as u64)
+    } else if f < K * K * K {
+        format!("{:.1}MB", f / (K * K))
+    } else {
+        format!("{:.1}GB", f / (K * K * K))
     }
 }
 
@@ -180,18 +202,22 @@ pub fn discover_with(
             let cutoff = last_dreamed_at.max(last_mined_at);
             let hours_since = cutoff.map(|t| (now - t).num_seconds() as f64 / 3600.0);
             let awaiting_review = db.unreviewed_completed(&project)?;
-            out.push(DiscoveredProject {
-                candidate_sessions: candidate_sessions(
-                    &project_dir,
-                    candidate_cutoff(
-                        cfg,
-                        if force { last_dreamed_at } else { cutoff },
-                        now,
-                        since_days,
-                    ),
+            let marks = db.session_marks(&project)?;
+            let candidates = candidate_sessions(
+                &project_dir,
+                candidate_cutoff(
+                    cfg,
+                    if force { last_dreamed_at } else { cutoff },
                     now,
-                    cfg.limits.min_transcript_bytes,
+                    since_days,
                 ),
+                now,
+                cfg.limits.min_transcript_bytes,
+                &marks,
+            );
+            out.push(DiscoveredProject {
+                new_bytes_total: candidates.iter().map(|s| s.new_bytes).sum(),
+                candidate_sessions: candidates,
                 project,
                 last_dreamed_at,
                 last_mined_at,
@@ -243,14 +269,18 @@ fn has_md(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// `*.jsonl` directly in `project_dir` with `mtime > since` (all when
-/// `since` is `None`), at least 10 minutes old and at least `min_bytes`
-/// long, newest first, capped at 100.
+/// `*.jsonl` directly in `project_dir` that hold unmined content, at least
+/// 10 minutes old, newest first, capped at 100. A session with a mark
+/// qualifies when its file grew past the mark (or shrank below it: a
+/// rewritten file is read again from the start), whatever its mtime; an
+/// unmarked one when `mtime > since` (always when `since` is `None`). Either
+/// way its `new_bytes` (length minus mark) must be at least `min_bytes`.
 pub fn candidate_sessions(
     project_dir: &Path,
     since: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
     min_bytes: u64,
+    marks: &HashMap<String, SessionMark>,
 ) -> Vec<SessionFile> {
     let Ok(rd) = std::fs::read_dir(project_dir) else {
         return Vec::new();
@@ -262,14 +292,29 @@ pub fn candidate_sessions(
         .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "jsonl"))
         .filter_map(|path| {
             let meta = std::fs::metadata(&path).ok()?;
-            if meta.len() < min_bytes {
-                return None;
-            }
             let mtime: DateTime<Utc> = meta.modified().ok()?.into();
             let id = path.file_stem()?.to_str()?.to_string();
-            Some(SessionFile { id, path, mtime })
+            let mark = marks.get(&id).copied();
+            let len = meta.len();
+            let new_bytes = match mark {
+                Some(m) if len == m.mined_through_bytes => return None,
+                Some(m) if len > m.mined_through_bytes => len - m.mined_through_bytes,
+                // Shrank below its mark: rewritten, read whole again.
+                Some(_) => len,
+                None if since.is_some_and(|t| mtime <= t) => return None,
+                None => len,
+            };
+            if new_bytes < min_bytes || mtime > live_cutoff {
+                return None;
+            }
+            Some(SessionFile {
+                id,
+                path,
+                mtime,
+                new_bytes,
+                mark,
+            })
         })
-        .filter(|s| since.is_none_or(|t| s.mtime > t) && s.mtime <= live_cutoff)
         .collect();
     files.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.id.cmp(&b.id)));
     files.truncate(MAX_SESSIONS);
@@ -469,6 +514,81 @@ mod tests {
         p
     }
 
+    fn none() -> HashMap<String, SessionMark> {
+        HashMap::new()
+    }
+
+    fn append(p: &Path, n: usize, age: Duration, now: DateTime<Utc>) {
+        use std::io::Write;
+        let mut f = std::fs::File::options().append(true).open(p).unwrap();
+        f.write_all("x".repeat(n - 1).as_bytes()).unwrap();
+        f.write_all(b"\n").unwrap();
+        f.set_modified((now - age).into()).unwrap();
+    }
+
+    fn mark(bytes: u64) -> SessionMark {
+        SessionMark {
+            mined_through_bytes: bytes,
+            mined_through_records: 1,
+        }
+    }
+
+    #[test]
+    fn candidates_follow_marks_not_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let grown = write_session(tmp.path(), "grown", Duration::hours(50), now);
+        let same = write_session(tmp.path(), "same", Duration::hours(1), now);
+        let small = write_session(tmp.path(), "small", Duration::hours(50), now);
+        let shrunk = write_session(tmp.path(), "shrunk", Duration::hours(50), now);
+        let live = write_session(tmp.path(), "live", Duration::hours(50), now);
+        write_session(tmp.path(), "unmarked-old", Duration::hours(50), now);
+        write_session(tmp.path(), "unmarked-new", Duration::hours(1), now);
+        let base = std::fs::metadata(&grown).unwrap().len();
+        let mut marks = none();
+        for (id, b) in [
+            ("grown", base),
+            ("same", std::fs::metadata(&same).unwrap().len()),
+            ("small", base),
+            ("shrunk", base + 1000),
+            ("live", base),
+        ] {
+            marks.insert(id.to_string(), mark(b));
+        }
+        append(&grown, 600, Duration::hours(40), now);
+        append(&small, 20, Duration::hours(40), now);
+        append(&live, 600, Duration::minutes(1), now);
+        let _ = shrunk;
+        let since = Some(now - Duration::hours(24));
+        let got: Vec<(String, u64, bool)> = candidate_sessions(tmp.path(), since, now, 30, &marks)
+            .into_iter()
+            .map(|s| (s.id, s.new_bytes, s.mark.is_some()))
+            .collect();
+        // grown: mtime is older than `since`, but it has a mark and grew;
+        // small grew by less than min_bytes; same did not grow; shrunk is
+        // read whole; live is inside the live window; unmarked-old is
+        // older than `since`.
+        let mut got = got;
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("grown".to_string(), 600, true),
+                ("shrunk".to_string(), base, true),
+                ("unmarked-new".to_string(), base, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn human_bytes_units() {
+        assert_eq!(human_bytes(0), "0B");
+        assert_eq!(human_bytes(1023), "1023B");
+        assert_eq!(human_bytes(12 * 1024 + 100), "12KB");
+        assert_eq!(human_bytes(1_258_291), "1.2MB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0GB");
+    }
+
     fn discovered(n: usize, hours_since: Option<f64>) -> DiscoveredProject {
         let now = Utc::now();
         DiscoveredProject {
@@ -483,12 +603,15 @@ mod tests {
                     id: format!("s{i}"),
                     path: format!("/c/s{i}.jsonl").into(),
                     mtime: now,
+                    new_bytes: 0,
+                    mark: None,
                 })
                 .collect(),
             last_dreamed_at: hours_since.map(|h| now - Duration::minutes((h * 60.0) as i64)),
             last_mined_at: None,
             hours_since,
             awaiting_review: None,
+            new_bytes_total: 0,
         }
     }
 
@@ -501,12 +624,12 @@ mod tests {
         write_session(tmp.path(), "fresh", Duration::hours(2), now);
         std::fs::write(tmp.path().join("notes.txt"), "x").unwrap();
         let since = Some(now - Duration::hours(24));
-        let ids: Vec<_> = candidate_sessions(tmp.path(), since, now, 0)
+        let ids: Vec<_> = candidate_sessions(tmp.path(), since, now, 0, &none())
             .into_iter()
             .map(|s| s.id)
             .collect();
         assert_eq!(ids, vec!["fresh"]);
-        let all: Vec<_> = candidate_sessions(tmp.path(), None, now, 0)
+        let all: Vec<_> = candidate_sessions(tmp.path(), None, now, 0, &none())
             .into_iter()
             .map(|s| s.id)
             .collect();
@@ -520,7 +643,7 @@ mod tests {
         for i in 0..105 {
             write_session(tmp.path(), &format!("s{i:03}"), Duration::hours(1 + i), now);
         }
-        let c = candidate_sessions(tmp.path(), None, now, 0);
+        let c = candidate_sessions(tmp.path(), None, now, 0, &none());
         assert_eq!(c.len(), 100);
         assert_eq!(c[0].id, "s000");
         assert_eq!(c[99].id, "s099");
@@ -533,8 +656,11 @@ mod tests {
         let now = Utc::now();
         let p = write_session(tmp.path(), "small", Duration::hours(2), now);
         let len = std::fs::metadata(&p).unwrap().len();
-        assert_eq!(candidate_sessions(tmp.path(), None, now, len).len(), 1);
-        assert!(candidate_sessions(tmp.path(), None, now, len + 1).is_empty());
+        assert_eq!(
+            candidate_sessions(tmp.path(), None, now, len, &none()).len(),
+            1
+        );
+        assert!(candidate_sessions(tmp.path(), None, now, len + 1, &none()).is_empty());
     }
 
     #[test]

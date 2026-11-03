@@ -26,12 +26,27 @@ impl Project {
     }
 }
 
+/// How far a session transcript has been mined: the absolute byte offset
+/// and JSONL record count a completed dream's digest consumed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMark {
+    pub mined_through_bytes: u64,
+    pub mined_through_records: usize,
+}
+
 /// A session transcript on disk.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionFile {
     pub id: String,
     pub path: PathBuf,
     pub mtime: DateTime<Utc>,
+    /// Bytes not yet mined: file length minus the mark (the whole file when
+    /// unmarked, or when the file shrank below its mark).
+    #[serde(default)]
+    pub new_bytes: u64,
+    /// The session's mark, if a completed dream mined it before.
+    #[serde(default)]
+    pub mark: Option<SessionMark>,
 }
 
 /// Lifecycle of a dream (mirrors the hosted Dreams API plus apply/rollback).
@@ -200,6 +215,9 @@ pub struct SessionRecord {
     pub usage: Usage,
     pub error: Option<String>,
     pub duration_ms: u64,
+    /// Transcript bytes the digest read (the delta for an incremental read).
+    #[serde(default)]
+    pub bytes_read: u64,
 }
 
 /// Worker output (validated by `findings_json_schema`).
@@ -208,6 +226,13 @@ pub struct Findings {
     pub insights: Vec<Insight>,
     pub stale: Vec<Stale>,
     pub corrections: Vec<Correction>,
+}
+
+impl Findings {
+    /// No insights, stale entries or corrections.
+    pub fn is_empty(&self) -> bool {
+        self.insights.is_empty() && self.stale.is_empty() && self.corrections.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

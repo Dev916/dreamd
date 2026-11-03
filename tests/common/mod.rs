@@ -183,3 +183,31 @@ pub fn cmd(f: &Fixture) -> assert_cmd::Command {
         .env_remove("DREAMD_LOG");
     c
 }
+
+/// Append real-shaped user/assistant records (alternating, numbered
+/// `{tag} turn N`) to a transcript until at least `bytes` were added, then
+/// age it 1h. Returns the bytes appended.
+pub fn append_turns(path: &Path, tag: &str, bytes: usize) -> usize {
+    use std::io::Write;
+    let mut add = String::new();
+    let mut i = 0;
+    while add.len() < bytes {
+        let filler = "lorem ipsum dolor sit amet ".repeat(8);
+        let line = if i % 2 == 0 {
+            format!(
+                "{{\"type\": \"user\", \"cwd\": \"/tmp/proj\", \"message\": {{\"role\": \"user\", \"content\": \"{tag} turn {i}: please keep going {filler}\"}}}}\n"
+            )
+        } else {
+            format!(
+                "{{\"type\": \"assistant\", \"cwd\": \"/tmp/proj\", \"message\": {{\"role\": \"assistant\", \"content\": [{{\"type\": \"text\", \"text\": \"{tag} turn {i}: done {filler}\"}}]}}}}\n"
+            )
+        };
+        add.push_str(&line);
+        i += 1;
+    }
+    let mut f = std::fs::File::options().append(true).open(path).unwrap();
+    f.write_all(add.as_bytes()).unwrap();
+    drop(f);
+    set_age(path, Duration::from_secs(3600));
+    add.len()
+}
