@@ -205,7 +205,9 @@ What a dream does (state is saved to SQLite after each stage):
    dream completes with an empty diff and `aggregate.md` = `Nothing to
    consolidate: N session(s) mined, no new insights.`, and `dream` prints
    `dream <id> completed: N sessions mined (X read), nothing to consolidate
-   (aggregator skipped)`.
+   (aggregator skipped, archived)`. Such a dream is archived automatically
+   so it never parks the project for review; its marks and cutoff still
+   advance.
 5. **Post-check** (fail closed): the live memory dir is unchanged, deletion
    manifest entries are valid, every new or edited `.md` has `name` and
    `description` frontmatter, every `MEMORY.md` link resolves, nothing outside

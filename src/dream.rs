@@ -502,6 +502,10 @@ async fn pipeline(
         std::fs::write(dir.join("aggregate.md"), format!("{summary}\n"))
             .context("write aggregate.md")?;
         db.set_result(id, usage, &summary, &DiffStats::default())?;
+        // An empty dream has nothing to review, so it must not park the project:
+        // archive it right away (the row stays readable by id).
+        db.set_archived(id, Utc::now())
+            .context("auto-archive empty dream")?;
         if canceled(ctx, id)? {
             return Ok(Stop::Canceled);
         }

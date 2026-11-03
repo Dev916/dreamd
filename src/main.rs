@@ -491,7 +491,7 @@ async fn dream_cmd(
                     let read = discover::human_bytes(dream::bytes_read(&ctx.db, &dr.id)?);
                     if dream::aggregator_skipped(&dr) {
                         println!(
-                            "dream {} completed: {n} sessions mined ({read} read), nothing to consolidate (aggregator skipped)",
+                            "dream {} completed: {n} sessions mined ({read} read), nothing to consolidate (aggregator skipped, archived)",
                             dr.id
                         );
                     } else {

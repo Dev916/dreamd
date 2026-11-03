@@ -243,7 +243,7 @@ fn empty_findings_skip_the_aggregator() {
     let s = out(&a);
     assert!(
         s.contains("completed: 3 sessions mined (")
-            && s.contains("read), nothing to consolidate (aggregator skipped)"),
+            && s.contains("read), nothing to consolidate (aggregator skipped, archived)"),
         "{s}"
     );
     let id = dream_id(&s);
@@ -270,6 +270,9 @@ fn empty_findings_skip_the_aggregator() {
     assert_eq!(db(&f).session_marks(&p).unwrap().len(), 3);
     let line = scan_line(&f);
     assert!(!line.contains("last=never"), "{line}");
+    // Empty dreams are auto-archived, so the project is not parked for review.
+    assert!(d.archived_at.is_some(), "empty dream should be archived");
+    assert!(!line.contains("awaiting review"), "{line}");
 }
 
 #[test]
