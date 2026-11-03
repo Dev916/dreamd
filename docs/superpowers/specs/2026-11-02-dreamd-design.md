@@ -96,6 +96,10 @@ The aggregator reads model-generated findings mined from transcripts, so it is t
 
 `dreamd apply <id>`: refuse unless status `completed`; recompute the live memory dir's hash and refuse if it differs from the `in/` hash (someone wrote memory since; rerun the dream) unless `--force`; copy live dir → `backup/`; stage `out/` to a sibling temp dir on the same filesystem; swap via rename (`memory` → `memory.dreamd-old`, temp → `memory`, remove old); set status `applied`, update `last_dreamed_at`. `dreamd rollback <id>`: reverse swap from `backup/`, status `rolled_back`. Both print the paths touched.
 
+### Locking
+
+One dream per project at a time. `prepare` takes `<data_dir>/locks/<sha256(project key) hex, first 16>.lock` (`create_new`, content = the owner's pid) *before* inserting the `pending` row, and the lock travels with the dream until `execute` returns (any terminal status); drop removes the file only while it still holds our pid. A held lock whose pid is alive (`kill(pid, 0)`) refuses the second dream: CLI `busy <slug>: project is already being dreamed by pid <pid>`, exit 3 (`--all` counts it as skipped); API 409 `busy`. A dead or unparsable pid is stale: the file is removed and the take retried once. Because every `pending`/`running` row has a lock, a row whose lock has no live holder is orphaned (its process crashed or was killed, e.g. `serve` stopped mid-dream): `sweep_orphans` marks it `failed` with `orphaned: owning process died` (a conditional update, so a dream finishing concurrently is never overwritten). The sweep runs at `serve` start and before `dream`, `list`, `scan`, `cancel` and `doctor` (`orphaned dreams` line).
+
 ### CLI
 
 ```
@@ -108,7 +112,7 @@ dreamd token                              # print the API bearer token (creates 
 dreamd schedule install|uninstall|status   # launchd dev.dreamd.nightly
 dreamd doctor                             # claude on PATH, config dirs, db, disk
 ```
-Exit codes: 0 ok, 2 gate-skipped/nothing to do, 3 refused (hash mismatch, bad status), 4 dream failed. `--json` on read commands.
+Exit codes: 0 ok, 2 gate-skipped/nothing to do, 3 refused (hash mismatch, bad status, project busy), 4 dream failed. `--json` on read commands.
 
 ### HTTP API (`dreamd serve`, 127.0.0.1 only)
 

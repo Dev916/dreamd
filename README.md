@@ -121,6 +121,7 @@ ok   data dir           /Users/webmech/.local/share/dreamd (writable)
 ok   database           /Users/webmech/.local/share/dreamd/dreamd.db
 ok   api token          /Users/webmech/.local/share/dreamd/api-token (absent; created on first serve)
 ok   launchd schedule   not installed (`dreamd schedule install` to run nightly)
+ok   orphaned dreams    none
 ok   last dream         none yet
 ```
 
@@ -133,6 +134,7 @@ ok   last dream         none yet
 | `database` | `dreamd.db` cannot be opened |
 | `api token` | `<data_dir>/api-token` is readable by group/other (must be 0600) |
 | `launchd schedule` | the installed plist runs a `dreamd` binary that no longer exists |
+| `orphaned dreams` | it just swept dreams left `pending`/`running` by a dead process (see Locking); the sweep repairs them, so the next run is ok |
 | `last dream` | the database cannot be read (otherwise informational: newest dream's id, status, project, error) |
 
 ## The loop: scan → dream → diff → apply / rollback
@@ -188,6 +190,22 @@ Data lives in `~/.local/share/dreamd/`: `dreamd.db`, and per dream
 `dreams/<id>/{in/, in.sha256, out/, findings/<session>.json, context/,
 aggregate.md, dream.diff, backup/}`.
 
+### Locking
+
+One dream per project at a time. Before a dream's row is created, dreamd
+takes `<data_dir>/locks/<first 16 hex of sha256(project key)>.lock`
+(created exclusively, holding the owner's pid) and keeps it until the dream
+ends, whatever its status. A second dream of the same project, from the CLI
+or the API, is refused while that pid is alive: `dream` prints
+`busy <slug>: project is already being dreamed by pid <pid>` and exits 3
+(`--all` counts it as skipped), `POST /v1/dreams` answers 409 `busy`. A lock
+whose pid is dead or unreadable is stale and is reclaimed. A dream left
+`pending`/`running` whose lock has no live holder (its process crashed or was
+killed, e.g. a `serve` stopped mid-dream) is marked `failed` with
+`orphaned: owning process died`; this sweep runs when `serve` starts and
+before `dream`, `list`, `scan`, `cancel` and `doctor` (stderr:
+`swept orphaned dream <id>`).
+
 ## HTTP API
 
 ```sh
@@ -215,7 +233,7 @@ curl -s -H "Authorization: Bearer $TOK" -X POST http://127.0.0.1:7720/v1/dreams/
 | --- | --- | --- |
 | GET | `/healthz` | no token |
 | GET | `/v1/projects` | dreamable projects + gate verdict |
-| POST | `/v1/dreams` | `{project, instructions?, model?, session_ids?, force?}` → 202 with the pending dream; 409 `skipped` when gated |
+| POST | `/v1/dreams` | `{project, instructions?, model?, session_ids?, force?}` → 202 with the pending dream; 409 `skipped` when gated, 409 `busy` when the project is already being dreamed |
 | GET | `/v1/dreams[?status=]` | list |
 | GET | `/v1/dreams/{id}` | one dream |
 | GET | `/v1/dreams/{id}/diff` | `text/plain` |
@@ -292,7 +310,7 @@ is treated as prompt-injectable. Containment, in layers:
 | 0 | ok |
 | 1 | error (bad config, I/O, `doctor` found a FAIL) |
 | 2 | gate-skipped / nothing to do |
-| 3 | refused: hash mismatch, bad status, unknown dream or project |
+| 3 | refused: hash mismatch, bad status, unknown dream or project, project busy |
 | 4 | dream failed (with `--all`: any project failed) |
 
 ## Troubleshooting
@@ -312,7 +330,11 @@ is treated as prompt-injectable. Containment, in layers:
   in a mode other than the one requested, almost always a wrapper.
 - **`apply` refused, hash mismatch**: memory changed since the snapshot.
   Rerun the dream (or `apply --force` to drop those changes).
-- **A dream stuck in `running`**: see Known limitations; `dreamd cancel <id>`.
+- **A dream stuck in `running`**: if its process is gone, the next `dreamd
+  list` (or `doctor`) sweeps it to `failed` (see Locking); if it is still
+  running, `dreamd cancel <id>`.
+- **`busy <slug>: project is already being dreamed by pid <pid>`**: wait for
+  that dream, or `dreamd cancel` it.
 - **Nightly job did nothing**: check `<data_dir>/logs/nightly.err.log` and
   `dreamd doctor` (`launchd schedule` line).
 - More logging: `DREAMD_LOG=info dreamd dream ...`. Every artifact (findings,
@@ -365,12 +387,9 @@ the same machine. Budget about $0.40 per mined session plus the aggregator.
 
 ## Known limitations
 
-- A dream started by `serve` runs as a detached task in the server process.
-  Killing the server mid-dream leaves the row `running`; there is no startup
-  sweep yet. `dreamd cancel <id>` clears it.
-- There is no per-project lock: don't start two dreams of the same project at
-  once (the second one's apply would be refused by the hash check, but both
-  spend tokens).
+- The lock is keyed by pid: if a crashed dream's pid is reused by an
+  unrelated process before the sweep runs, the project stays busy until that
+  process exits (or the lock file is removed by hand).
 - A live Claude Code session writing that project's memory during a dream
   fails the dream (by design).
 - `autoMemoryDirectory` is read from `<config_dir>/settings.json` only, not
