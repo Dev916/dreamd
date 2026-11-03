@@ -133,6 +133,8 @@ pub struct CreateDream {
 #[derive(Debug, Deserialize)]
 struct ListQuery {
     status: Option<String>,
+    #[serde(default)]
+    include_archived: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -257,6 +259,7 @@ pub fn router(state: AppState, guard_cfg: Guard) -> Router {
         .route("/v1/dreams/{id}/cancel", post(cancel))
         .route("/v1/dreams/{id}/apply", post(apply_dream))
         .route("/v1/dreams/{id}/rollback", post(rollback_dream))
+        .route("/v1/dreams/{id}/archive", post(archive_dream))
         .fallback(|| async { Problem::not_found("no such route") })
         .with_state(state)
         .layer(middleware::from_fn_with_state(Arc::new(guard_cfg), guard))
@@ -335,7 +338,7 @@ async fn list_dreams(
             )
         })?),
     };
-    blocking(move || Ok(Json(ctx.db.list_dreams(status)?))).await
+    blocking(move || Ok(Json(ctx.db.list_dreams(status, q.include_archived)?))).await
 }
 
 async fn create_dream(
@@ -355,7 +358,8 @@ async fn create_dream(
     let ctx2 = Arc::clone(&ctx);
     let opts2 = opts.clone();
     let outcome = blocking(move || {
-        let found = discover::discover(&ctx2.cfg, &ctx2.db, chrono::Utc::now())?;
+        let found =
+            discover::discover_with(&ctx2.cfg, &ctx2.db, chrono::Utc::now(), None, opts2.force)?;
         let Some(d) = discover::select_projects(found, Some(&selector))
             .into_iter()
             .next()
@@ -464,6 +468,22 @@ async fn rollback_dream(
     blocking(move || {
         apply::rollback(&ctx, &id)?;
         Ok(Json(load(&ctx, &id)?))
+    })
+    .await
+}
+
+/// Archive a terminal dream (409 `refused` while pending/running).
+async fn archive_dream(
+    State(AppState(ctx)): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Dream>> {
+    blocking(move || match dream::archive(&ctx.db, &id) {
+        Ok(d) => Ok(Json(d)),
+        Err(dream::ArchiveError::NotFound) => {
+            Err(Problem::not_found(format!("dream not found: {id}")))
+        }
+        Err(e @ dream::ArchiveError::Active(_)) => Err(Problem::refused(e)),
+        Err(dream::ArchiveError::Db(e)) => Err(e.into()),
     })
     .await
 }

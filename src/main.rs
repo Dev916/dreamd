@@ -69,17 +69,17 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
             print!("{}", cfg.to_toml()?);
             Ok(EXIT_OK)
         }
-        Command::List => {
+        Command::List { include_archived } => {
             let db = Db::open(&cfg.db_path())?;
             sweep(&cfg, &db)?;
-            let dreams = db.list_dreams(None)?;
+            let dreams = db.list_dreams(None, include_archived)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&dreams)?);
             } else if dreams.is_empty() {
                 println!("no dreams");
             } else {
                 for d in &dreams {
-                    println!(
+                    let mut line = format!(
                         "{}  {:<11}  {}  {}  {}",
                         d.id,
                         d.status,
@@ -87,6 +87,10 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
                         d.project.slug,
                         d.model
                     );
+                    if include_archived && d.archived_at.is_some() {
+                        line.push_str("  archived");
+                    }
+                    println!("{line}");
                 }
             }
             Ok(EXIT_OK)
@@ -144,6 +148,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Cancel { id } => cancel_cmd(&cfg, &id),
         Command::Apply { id, force } => apply_cmd(&id, Some(force)),
         Command::Rollback { id } => apply_cmd(&id, None),
+        Command::Archive { id } => archive_cmd(&cfg, &id),
         Command::Scan { all_dirs } => {
             let db = Db::open(&cfg.db_path())?;
             sweep(&cfg, &db)?;
@@ -397,7 +402,13 @@ async fn dream_cmd(
 ) -> anyhow::Result<i32> {
     let ctx = dream::Ctx::from_env()?;
     sweep(&ctx.cfg, &ctx.db)?;
-    let found = discover::discover_with(&ctx.cfg, &ctx.db, chrono::Utc::now(), since_days)?;
+    let found = discover::discover_with(
+        &ctx.cfg,
+        &ctx.db,
+        chrono::Utc::now(),
+        since_days,
+        opts.force,
+    )?;
     let targets = discover::select_projects(found, if all { None } else { selector });
     if targets.is_empty() {
         if all {
@@ -647,6 +658,31 @@ fn apply_cmd(id: &str, force: Option<bool>) -> anyhow::Result<i32> {
     }
 }
 
+/// `archive`: set a terminal dream aside; pending/running → exit 3.
+fn archive_cmd(cfg: &config::Config, id: &str) -> anyhow::Result<i32> {
+    let db = Db::open(&cfg.db_path())?;
+    sweep(cfg, &db)?;
+    match dream::archive(&db, id) {
+        Ok(d) => {
+            let at = d
+                .archived_at
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .unwrap_or_default();
+            println!("archived {id} ({}, at {at})", d.status);
+            Ok(EXIT_OK)
+        }
+        Err(dream::ArchiveError::NotFound) => {
+            eprintln!("dream not found: {id}");
+            Ok(EXIT_REFUSED)
+        }
+        Err(e @ dream::ArchiveError::Active(_)) => {
+            eprintln!("refused: {e}");
+            Ok(EXIT_REFUSED)
+        }
+        Err(dream::ArchiveError::Db(e)) => Err(e),
+    }
+}
+
 /// `cancel`: mark a pending/running dream canceled and SIGTERM its process.
 fn cancel_cmd(cfg: &config::Config, id: &str) -> anyhow::Result<i32> {
     let db = Db::open(&cfg.db_path())?;
@@ -715,6 +751,7 @@ fn render_dream(d: &Dream) -> String {
     line("output_dir", d.output_dir.display().to_string());
     line("instructions", opt(d.instructions.clone()));
     line("error", opt(d.error.clone()));
+    line("archived_at", opt(d.archived_at.map(|t| t.to_rfc3339())));
     if let Some(s) = &d.summary {
         out.push_str(&format!("\n{s}\n"));
     }

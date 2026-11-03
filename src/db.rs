@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS projects (
     slug            TEXT NOT NULL,
     cwd             TEXT,
     memory_dir      TEXT NOT NULL,
-    last_dreamed_at TEXT
+    last_dreamed_at TEXT,
+    last_mined_at   TEXT
 );
 CREATE TABLE IF NOT EXISTS dreams (
     id               TEXT PRIMARY KEY,
@@ -37,7 +38,8 @@ CREATE TABLE IF NOT EXISTS dreams (
     error            TEXT,
     output_dir       TEXT NOT NULL,
     diff_stats_json  TEXT,
-    pid              INTEGER
+    pid              INTEGER,
+    archived_at      TEXT
 );
 CREATE INDEX IF NOT EXISTS dreams_created_at ON dreams(created_at);
 CREATE TABLE IF NOT EXISTS dream_sessions (
@@ -60,7 +62,14 @@ CREATE TABLE IF NOT EXISTS applies (
 
 const DREAM_COLS: &str = "d.id, d.status, d.model, d.instructions, d.session_ids_json, \
      d.created_at, d.ended_at, d.usage_json, d.summary, d.error, d.output_dir, \
-     d.diff_stats_json, d.pid, p.config_dir, p.slug, p.cwd, p.memory_dir";
+     d.diff_stats_json, d.pid, p.config_dir, p.slug, p.cwd, p.memory_dir, d.archived_at";
+
+/// Columns added after v0.1.0: `(table, column, type)`. Added on open when
+/// missing, so databases created by older binaries upgrade in place.
+const MIGRATIONS: &[(&str, &str, &str)] = &[
+    ("projects", "last_mined_at", "TEXT"),
+    ("dreams", "archived_at", "TEXT"),
+];
 
 /// The dreamd database. `Send + Sync`; every call takes the connection lock.
 pub struct Db {
@@ -93,6 +102,7 @@ fn row_to_dream(r: &Row<'_>) -> anyhow::Result<Dream> {
     let config_dir: String = r.get(13)?;
     let cwd: Option<String> = r.get(15)?;
     let memory_dir: String = r.get(16)?;
+    let archived_at: Option<String> = r.get(17)?;
     Ok(Dream {
         id: r.get(0)?,
         project: Project {
@@ -117,6 +127,7 @@ fn row_to_dream(r: &Row<'_>) -> anyhow::Result<Dream> {
             .transpose()
             .context("diff_stats_json")?,
         pid: pid.map(u32::try_from).transpose().context("pid")?,
+        archived_at: archived_at.as_deref().map(parse_ts).transpose()?,
     })
 }
 
@@ -167,9 +178,25 @@ impl Db {
     fn init(conn: Connection) -> anyhow::Result<Db> {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA).context("create schema")?;
+        Self::migrate(&conn)?;
         Ok(Db {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Add any [`MIGRATIONS`] column the table lacks (guarded `ALTER TABLE`).
+    fn migrate(conn: &Connection) -> anyhow::Result<()> {
+        for (table, column, ty) in MIGRATIONS {
+            let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<Result<_, _>>()?;
+            if !cols.iter().any(|c| c == column) {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))
+                    .with_context(|| format!("migrate: add {table}.{column}"))?;
+            }
+        }
+        Ok(())
     }
 
     fn conn(&self) -> MutexGuard<'_, Connection> {
@@ -221,6 +248,54 @@ impl Db {
         Ok(())
     }
 
+    /// When a dream of this project last completed (its sessions are mined
+    /// through then, whether or not it was applied).
+    pub fn last_mined_at(&self, p: &Project) -> anyhow::Result<Option<DateTime<Utc>>> {
+        let v: Option<Option<String>> = self
+            .conn()
+            .query_row(
+                "SELECT last_mined_at FROM projects WHERE key = ?1",
+                [p.key()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        v.flatten().as_deref().map(parse_ts).transpose()
+    }
+
+    pub fn set_last_mined_at(&self, p: &Project, at: DateTime<Utc>) -> anyhow::Result<()> {
+        let conn = self.conn();
+        Self::upsert_project_on(&conn, p)?;
+        conn.execute(
+            "UPDATE projects SET last_mined_at = ?2 WHERE key = ?1",
+            params![p.key(), ts(at)],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a dream archived (hidden from `list`); keeps the first stamp.
+    pub fn set_archived(&self, id: &str, at: DateTime<Utc>) -> anyhow::Result<()> {
+        let n = self.conn().execute(
+            "UPDATE dreams SET archived_at = COALESCE(archived_at, ?2) WHERE id = ?1",
+            params![id, ts(at)],
+        )?;
+        expect_one(n, "dream", id)
+    }
+
+    /// The newest `completed`, unarchived dream of this project (one that
+    /// still awaits apply, rollback or archive), if any.
+    pub fn unreviewed_completed(&self, p: &Project) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id FROM dreams WHERE project_key = ?1 AND status = 'completed'
+                     AND archived_at IS NULL
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                [p.key()],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// Insert a dream (upserting its project first).
     pub fn insert_dream(&self, d: &Dream) -> anyhow::Result<()> {
         let mut conn = self.conn();
@@ -228,8 +303,9 @@ impl Db {
         Self::upsert_project_on(&tx, &d.project)?;
         tx.execute(
             "INSERT INTO dreams (id, project_key, status, model, instructions, session_ids_json,
-                 created_at, ended_at, usage_json, summary, error, output_dir, diff_stats_json, pid)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 created_at, ended_at, usage_json, summary, error, output_dir, diff_stats_json, pid,
+                 archived_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 d.id,
                 d.project.key(),
@@ -246,7 +322,8 @@ impl Db {
                 d.diff_stats
                     .map(|s| serde_json::to_string(&s))
                     .transpose()?,
-                d.pid
+                d.pid,
+                d.archived_at.map(ts)
             ],
         )
         .with_context(|| format!("insert dream {}", d.id))?;
@@ -330,15 +407,20 @@ impl Db {
         rows.next()?.map(row_to_dream).transpose()
     }
 
-    /// All dreams (optionally of one status), newest first.
-    pub fn list_dreams(&self, status: Option<DreamStatus>) -> anyhow::Result<Vec<Dream>> {
+    /// All dreams (optionally of one status), newest first. Archived dreams
+    /// are left out unless `include_archived`.
+    pub fn list_dreams(
+        &self,
+        status: Option<DreamStatus>,
+        include_archived: bool,
+    ) -> anyhow::Result<Vec<Dream>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
             "SELECT {DREAM_COLS} FROM dreams d JOIN projects p ON p.key = d.project_key
-             WHERE ?1 IS NULL OR d.status = ?1
+             WHERE (?1 IS NULL OR d.status = ?1) AND (?2 OR d.archived_at IS NULL)
              ORDER BY d.created_at DESC, d.id DESC"
         ))?;
-        let mut rows = stmt.query([status.map(|s| s.as_str())])?;
+        let mut rows = stmt.query(params![status.map(|s| s.as_str()), include_archived])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
             out.push(row_to_dream(r)?);
@@ -454,6 +536,7 @@ mod tests {
             output_dir: "/data/dreams/x".into(),
             diff_stats: None,
             pid: None,
+            archived_at: None,
         }
     }
 
@@ -519,15 +602,15 @@ mod tests {
         }
         let ids = |v: Vec<Dream>| v.into_iter().map(|d| d.id).collect::<Vec<_>>();
         assert_eq!(
-            ids(db.list_dreams(None).unwrap()),
+            ids(db.list_dreams(None, false).unwrap()),
             vec![c.id.clone(), b.id.clone(), a.id.clone()]
         );
         assert_eq!(
-            ids(db.list_dreams(Some(DreamStatus::Completed)).unwrap()),
+            ids(db.list_dreams(Some(DreamStatus::Completed), false).unwrap()),
             vec![c.id.clone(), a.id.clone()]
         );
         assert!(db
-            .list_dreams(Some(DreamStatus::Applied))
+            .list_dreams(Some(DreamStatus::Applied), false)
             .unwrap()
             .is_empty());
     }
@@ -603,7 +686,84 @@ mod tests {
             .unwrap();
         drop(db);
         assert!(path.exists());
-        assert_eq!(Db::open(&path).unwrap().list_dreams(None).unwrap().len(), 1);
+        assert_eq!(
+            Db::open(&path)
+                .unwrap()
+                .list_dreams(None, false)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn last_mined_at_none_then_set() {
+        let db = Db::open_memory().unwrap();
+        let p = project("p1");
+        assert_eq!(db.last_mined_at(&p).unwrap(), None);
+        let t = Utc::now();
+        db.set_last_mined_at(&p, t).unwrap();
+        assert_eq!(db.last_mined_at(&p).unwrap(), Some(t));
+        assert_eq!(db.last_dreamed_at(&p).unwrap(), None);
+        db.upsert_project(&p).unwrap();
+        assert_eq!(db.last_mined_at(&p).unwrap(), Some(t));
+    }
+
+    #[test]
+    fn archive_hides_from_list_and_clears_unreviewed() {
+        let db = Db::open_memory().unwrap();
+        let now = Utc::now();
+        let a = dream("p1", now - Duration::hours(1), DreamStatus::Completed);
+        let b = dream("p1", now, DreamStatus::Failed);
+        db.insert_dream(&a).unwrap();
+        db.insert_dream(&b).unwrap();
+        let p = project("p1");
+        assert_eq!(db.unreviewed_completed(&p).unwrap(), Some(a.id.clone()));
+        assert_eq!(db.unreviewed_completed(&project("p2")).unwrap(), None);
+
+        let t = now + Duration::minutes(1);
+        db.set_archived(&a.id, t).unwrap();
+        // Idempotent: the first stamp is kept.
+        db.set_archived(&a.id, t + Duration::minutes(5)).unwrap();
+        assert_eq!(db.get_dream(&a.id).unwrap().unwrap().archived_at, Some(t));
+        assert_eq!(db.unreviewed_completed(&p).unwrap(), None);
+        let ids = |v: Vec<Dream>| v.into_iter().map(|d| d.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(db.list_dreams(None, false).unwrap()),
+            vec![b.id.clone()]
+        );
+        assert_eq!(
+            ids(db.list_dreams(None, true).unwrap()),
+            vec![b.id.clone(), a.id.clone()]
+        );
+        assert!(db
+            .list_dreams(Some(DreamStatus::Completed), false)
+            .unwrap()
+            .is_empty());
+        assert!(db.set_archived("drm_missing", t).is_err());
+    }
+
+    #[test]
+    fn open_migrates_v0_1_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            let old = SCHEMA
+                .replace(",\n    last_mined_at   TEXT", "")
+                .replace(",\n    archived_at      TEXT", "");
+            assert!(!old.contains("last_mined_at") && !old.contains("archived_at"));
+            c.execute_batch(&old).unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let d = dream("p1", Utc::now(), DreamStatus::Completed);
+        db.insert_dream(&d).unwrap();
+        db.set_archived(&d.id, Utc::now()).unwrap();
+        db.set_last_mined_at(&d.project, Utc::now()).unwrap();
+        drop(db);
+        // Re-opening a migrated database is a no-op.
+        let db = Db::open(&path).unwrap();
+        assert!(db.get_dream(&d.id).unwrap().unwrap().archived_at.is_some());
     }
 
     #[test]

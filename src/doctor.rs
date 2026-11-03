@@ -216,7 +216,7 @@ fn plist_program(xml: &str) -> Option<String> {
 /// Informational: the newest dream (id, status, project, when). ok unless
 /// the database cannot be read.
 fn check_last_dream(db_path: &Path) -> Check {
-    let res = crate::db::Db::open(db_path).and_then(|db| db.list_dreams(None));
+    let res = crate::db::Db::open(db_path).and_then(|db| db.list_dreams(None, true));
     let (ok, detail) = match res {
         Ok(dreams) => match dreams.first() {
             None => (true, "none yet".to_string()),

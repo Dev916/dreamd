@@ -83,6 +83,7 @@ fn insert_running(f: &common::Fixture, slug: &str) -> String {
         output_dir: f.data_dir.join("dreams").join(&id).join("out"),
         diff_stats: None,
         pid: Some(dead_pid()),
+        archived_at: None,
     };
     db.upsert_project(&p).unwrap();
     db.insert_dream(&d).unwrap();
@@ -161,7 +162,11 @@ fn killed_dream_is_swept_as_orphan() {
     let db = Db::open(&f.data_dir.join("dreamd.db")).unwrap();
     let t = Instant::now();
     let id = loop {
-        if let Some(d) = db.list_dreams(Some(DreamStatus::Running)).unwrap().first() {
+        if let Some(d) = db
+            .list_dreams(Some(DreamStatus::Running), false)
+            .unwrap()
+            .first()
+        {
             break d.id.clone();
         }
         assert!(t.elapsed() < Duration::from_secs(10));

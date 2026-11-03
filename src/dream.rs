@@ -254,6 +254,7 @@ pub fn prepare(ctx: &Ctx, d: &DiscoveredProject, opts: &DreamOpts) -> anyhow::Re
         output_dir: dir.join("out"),
         diff_stats: None,
         pid: None,
+        archived_at: None,
     };
     ctx.db.upsert_project(&d.project)?;
     ctx.db.insert_dream(&dream)?;
@@ -297,6 +298,9 @@ pub async fn execute(ctx: &Ctx, prepared: PreparedDream, opts: DreamOpts) -> any
     match res {
         Ok(Stop::Completed) => {
             ctx.db.update_status(&id, DreamStatus::Completed, None)?;
+            // Its sessions are mined: later dreams start after them, applied
+            // or not (failed/canceled dreams leave the cutoff alone).
+            ctx.db.set_last_mined_at(&dream.project, Utc::now())?;
         }
         Ok(Stop::Canceled) => {}
         Err(e) => {
@@ -533,7 +537,7 @@ pub fn sweep_orphans(ctx: &Ctx) -> anyhow::Result<Vec<String>> {
 pub fn sweep_orphans_in(cfg: &Config, db: &Db) -> anyhow::Result<Vec<String>> {
     let mut swept = Vec::new();
     for status in [DreamStatus::Pending, DreamStatus::Running] {
-        for d in db.list_dreams(Some(status))? {
+        for d in db.list_dreams(Some(status), true)? {
             if crate::lock::holder(cfg, &d.project).is_none()
                 && db.fail_if_active(&d.id, ORPHANED)?
             {
@@ -542,6 +546,42 @@ pub fn sweep_orphans_in(cfg: &Config, db: &Db) -> anyhow::Result<Vec<String>> {
         }
     }
     Ok(swept)
+}
+
+/// Why [`archive`] did not archive a dream.
+#[derive(Debug)]
+pub enum ArchiveError {
+    NotFound,
+    /// Still pending or running.
+    Active(DreamStatus),
+    Db(anyhow::Error),
+}
+
+impl std::fmt::Display for ArchiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArchiveError::NotFound => f.write_str("dream not found"),
+            ArchiveError::Active(st) => write!(f, "dream is {st}"),
+            ArchiveError::Db(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+/// Archive a terminal dream (completed, failed, canceled, applied,
+/// rolled_back): hide it from `list` and stop it parking its project.
+/// Idempotent; returns the archived dream.
+pub fn archive(db: &Db, id: &str) -> Result<Dream, ArchiveError> {
+    let d = db
+        .get_dream(id)
+        .map_err(ArchiveError::Db)?
+        .ok_or(ArchiveError::NotFound)?;
+    if !d.status.is_terminal() {
+        return Err(ArchiveError::Active(d.status));
+    }
+    db.set_archived(id, Utc::now()).map_err(ArchiveError::Db)?;
+    db.get_dream(id)
+        .map_err(ArchiveError::Db)?
+        .ok_or(ArchiveError::NotFound)
 }
 
 /// Number of sessions that mined successfully.

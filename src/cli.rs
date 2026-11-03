@@ -46,7 +46,7 @@ pub enum Command {
         /// Dream every dreamable project (gate applied per project).
         #[arg(long)]
         all: bool,
-        /// Bypass the min_hours / min_sessions gate.
+        /// Bypass the gate (awaiting review, min_hours, min_sessions).
         #[arg(long)]
         force: bool,
         /// Override the aggregator model.
@@ -70,8 +70,12 @@ pub enum Command {
         #[arg(long, value_name = "N")]
         max_sessions: Option<usize>,
     },
-    /// List dreams.
-    List,
+    /// List dreams (archived ones only with --include-archived).
+    List {
+        /// Also show archived dreams (marked `archived`).
+        #[arg(long)]
+        include_archived: bool,
+    },
     /// Show one dream.
     Show { id: String },
     /// Print a dream's unified diff.
@@ -89,6 +93,9 @@ pub enum Command {
     },
     /// Restore the pre-apply backup of an applied dream.
     Rollback { id: String },
+    /// Set a finished dream aside without applying it (hides it from
+    /// `list` and unparks its project).
+    Archive { id: String },
     /// Run the loopback HTTP API.
     Serve {
         #[arg(long)]

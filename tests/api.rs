@@ -115,6 +115,7 @@ async fn guards(base: &str, token: &str) {
         ("/v1/dreams/drm_x/cancel", true),
         ("/v1/dreams/drm_x/apply", true),
         ("/v1/dreams/drm_x/rollback", true),
+        ("/v1/dreams/drm_x/archive", true),
     ] {
         let url = format!("{base}{path}");
         let req = |auth: Option<String>| {
@@ -371,7 +372,7 @@ async fn api_end_to_end() {
             .unwrap();
         problem(r, StatusCode::NOT_FOUND, "not found").await;
     }
-    for action in ["apply", "rollback", "cancel"] {
+    for action in ["apply", "rollback", "cancel", "archive"] {
         let r = c
             .post(format!("{base}/v1/dreams/drm_nope/{action}"))
             .send()
@@ -426,6 +427,14 @@ async fn api_end_to_end() {
         assert!(start_t.elapsed() < Duration::from_secs(10), "{d}");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // Archiving a running dream is refused.
+    let r = c
+        .post(format!("{base}/v1/dreams/{slow_id}/archive"))
+        .send()
+        .await
+        .unwrap();
+    let body = problem(r, StatusCode::CONFLICT, "refused").await;
+    assert_eq!(body["detail"], "refused: dream is running");
     // A second dream of the same project while this one runs → 409 busy.
     let r = c
         .post(format!("{base}/v1/dreams"))
@@ -539,6 +548,29 @@ async fn api_end_to_end() {
         .unwrap();
     assert_eq!(all.as_array().unwrap().len(), 2);
 
+    // A completed, unreviewed dream parks the project; its sessions are
+    // mined through now.
+    let r = c
+        .post(format!("{base}/v1/dreams"))
+        .json(&json!({"project": common::SLUG}))
+        .send()
+        .await
+        .unwrap();
+    let body = problem(r, StatusCode::CONFLICT, "skipped").await;
+    assert_eq!(
+        body["detail"],
+        format!("awaiting review: {id} (apply, rollback or archive it)")
+    );
+    let projects: Value = c
+        .get(format!("{base}/v1/projects"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(projects[0]["last_mined_at"].is_string(), "{projects}");
+
     // cancel a terminal dream → 409
     let r = c
         .post(format!("{base}/v1/dreams/{id}/cancel"))
@@ -573,6 +605,52 @@ async fn api_end_to_end() {
     let d: Value = r.json().await.unwrap();
     assert_eq!(d["status"], "rolled_back", "{d}");
     assert!(!f.memory_dir.join("dreamed.md").exists());
+
+    // Archive: 200 with archived_at, hidden from the default list, shown
+    // with include_archived; archiving again is a no-op.
+    let r = c
+        .post(format!("{base}/v1/dreams/{id}/archive"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let d: Value = r.json().await.unwrap();
+    assert_eq!(d["status"], "rolled_back", "{d}");
+    let archived_at = d["archived_at"].clone();
+    assert!(archived_at.is_string(), "{d}");
+    let r = c
+        .post(format!("{base}/v1/dreams/{id}/archive"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.json::<Value>().await.unwrap()["archived_at"], archived_at);
+    let list_ids = |v: Value| -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let all: Value = c
+        .get(format!("{base}/v1/dreams"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list_ids(all), vec![slow_id.clone()]);
+    let all: Value = c
+        .get(format!("{base}/v1/dreams?include_archived=true"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list_ids(all), vec![id.clone(), slow_id.clone()]);
+    assert_eq!(get_dream(&c, &base, &id).await["archived_at"], archived_at);
 
     // Nothing new since the dream: an unforced create is gate-skipped.
     let r = c

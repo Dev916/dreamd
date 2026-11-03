@@ -272,6 +272,7 @@ mod tests {
             output_dir: dir.join("out"),
             diff_stats: None,
             pid: None,
+            archived_at: None,
         };
         ctx.db.insert_dream(&d).unwrap();
         T {

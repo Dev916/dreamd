@@ -74,6 +74,7 @@ fn scan_json_has_expected_keys() {
             "config_dir",
             "cwd",
             "last_dreamed_at",
+            "last_mined_at",
             "memory_dir",
             "selected_sessions",
             "slug",
@@ -85,6 +86,7 @@ fn scan_json_has_expected_keys() {
     assert_eq!(obj["selected_sessions"], 3);
     assert_eq!(obj["cwd"], "/tmp/proj");
     assert_eq!(obj["last_dreamed_at"], serde_json::Value::Null);
+    assert_eq!(obj["last_mined_at"], serde_json::Value::Null);
     assert_eq!(obj["verdict"], "run");
     assert_eq!(
         obj["memory_dir"].as_str().unwrap(),

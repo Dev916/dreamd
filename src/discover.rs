@@ -22,7 +22,20 @@ pub struct DiscoveredProject {
     pub project: Project,
     pub candidate_sessions: Vec<SessionFile>,
     pub last_dreamed_at: Option<DateTime<Utc>>,
+    /// When a dream of this project last completed (applied or not).
+    pub last_mined_at: Option<DateTime<Utc>>,
+    /// Hours since [`DiscoveredProject::cutoff`].
     pub hours_since: Option<f64>,
+    /// A `completed`, unarchived dream that still awaits review.
+    pub awaiting_review: Option<String>,
+}
+
+impl DiscoveredProject {
+    /// The project's sessions are mined through this instant:
+    /// `max(last_dreamed_at, last_mined_at)`.
+    pub fn cutoff(&self) -> Option<DateTime<Utc>> {
+        self.last_dreamed_at.max(self.last_mined_at)
+    }
 }
 
 /// Gate verdict for one project.
@@ -52,6 +65,7 @@ pub struct ScanRow {
     /// Sessions a single dream would mine under the current caps.
     pub selected_sessions: usize,
     pub last_dreamed_at: Option<DateTime<Utc>>,
+    pub last_mined_at: Option<DateTime<Utc>>,
     pub verdict: String,
 }
 
@@ -68,14 +82,16 @@ impl ScanRow {
                 .len()
                 .min(cfg.limits.max_sessions_per_dream),
             last_dreamed_at: d.last_dreamed_at,
+            last_mined_at: d.last_mined_at,
             verdict: gate(d, cfg, false).to_string(),
         }
     }
 
-    /// One human-readable table line.
+    /// One human-readable table line; `last=` is the mined-through cutoff.
     pub fn render(&self) -> String {
         let last = self
             .last_dreamed_at
+            .max(self.last_mined_at)
             .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
             .unwrap_or_else(|| "never".into());
         format!(
@@ -98,12 +114,13 @@ pub fn discover(
     db: &Db,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Vec<DiscoveredProject>> {
-    discover_with(cfg, db, now, None)
+    discover_with(cfg, db, now, None, false)
 }
 
 /// The oldest transcript mtime a project's candidates may have (exclusive):
 /// `since_days` (CLI `--since-days`) wins when given (`0` = no limit);
-/// otherwise the last dream, or for a never-dreamed project the
+/// otherwise `last` (the project's mined-through cutoff, see
+/// [`DiscoveredProject::cutoff`]), or for a never-dreamed project the
 /// `limits.backfill_days` window (`0` = no limit).
 pub fn candidate_cutoff(
     cfg: &Config,
@@ -119,12 +136,15 @@ pub fn candidate_cutoff(
 }
 
 /// [`discover`] with an optional `--since-days` override of the candidate
-/// window (see [`candidate_cutoff`]).
+/// window (see [`candidate_cutoff`]). `force` (`dream --force`) windows
+/// candidates by `last_dreamed_at` alone, ignoring `last_mined_at`, so a
+/// forced re-dream can re-mine sessions an unapplied dream already mined.
 pub fn discover_with(
     cfg: &Config,
     db: &Db,
     now: DateTime<Utc>,
     since_days: Option<u64>,
+    force: bool,
 ) -> anyhow::Result<Vec<DiscoveredProject>> {
     let mut out = Vec::new();
     for config_dir in &cfg.config_dirs {
@@ -155,18 +175,28 @@ pub fn discover_with(
                 cwd: project_cwd(&project_dir),
                 memory_dir,
             };
-            let last = db.last_dreamed_at(&project)?;
-            let hours_since = last.map(|t| (now - t).num_seconds() as f64 / 3600.0);
+            let last_dreamed_at = db.last_dreamed_at(&project)?;
+            let last_mined_at = db.last_mined_at(&project)?;
+            let cutoff = last_dreamed_at.max(last_mined_at);
+            let hours_since = cutoff.map(|t| (now - t).num_seconds() as f64 / 3600.0);
+            let awaiting_review = db.unreviewed_completed(&project)?;
             out.push(DiscoveredProject {
                 candidate_sessions: candidate_sessions(
                     &project_dir,
-                    candidate_cutoff(cfg, last, now, since_days),
+                    candidate_cutoff(
+                        cfg,
+                        if force { last_dreamed_at } else { cutoff },
+                        now,
+                        since_days,
+                    ),
                     now,
                     cfg.limits.min_transcript_bytes,
                 ),
                 project,
-                last_dreamed_at: last,
+                last_dreamed_at,
+                last_mined_at,
                 hours_since,
+                awaiting_review,
             });
         }
     }
@@ -246,11 +276,17 @@ pub fn candidate_sessions(
     files
 }
 
-/// Should this project be dreamed now? `force` always runs; a project that
-/// was never dreamed satisfies the hours requirement.
+/// Should this project be dreamed now? `force` always runs; a project with
+/// a completed dream awaiting review is parked (checked first); a project
+/// that was never dreamed satisfies the hours requirement.
 pub fn gate(d: &DiscoveredProject, cfg: &Config, force: bool) -> Gate {
     if force {
         return Gate::Run;
+    }
+    if let Some(id) = &d.awaiting_review {
+        return Gate::Skip(format!(
+            "awaiting review: {id} (apply, rollback or archive it)"
+        ));
     }
     if let Some(h) = d.hours_since {
         if h < cfg.min_hours as f64 {
@@ -450,7 +486,9 @@ mod tests {
                 })
                 .collect(),
             last_dreamed_at: hours_since.map(|h| now - Duration::minutes((h * 60.0) as i64)),
+            last_mined_at: None,
             hours_since,
+            awaiting_review: None,
         }
     }
 
@@ -600,6 +638,63 @@ mod tests {
         assert_eq!(g, Gate::Skip("need 3 sessions, have 2".into()));
         assert_eq!(g.to_string(), "skip (need 3 sessions, have 2)");
         assert_eq!(gate(&discovered(3, None), &cfg, false), Gate::Run);
+    }
+
+    #[test]
+    fn gate_parks_project_awaiting_review_before_other_checks() {
+        let cfg = Config::default();
+        let mut d = discovered(0, Some(1.0));
+        d.awaiting_review = Some("drm_X".into());
+        assert_eq!(
+            gate(&d, &cfg, false),
+            Gate::Skip("awaiting review: drm_X (apply, rollback or archive it)".into())
+        );
+        assert_eq!(gate(&d, &cfg, true), Gate::Run);
+    }
+
+    #[test]
+    fn cutoff_is_later_of_dreamed_and_mined() {
+        let now = Utc::now();
+        let mut d = discovered(0, None);
+        assert_eq!(d.cutoff(), None);
+        d.last_mined_at = Some(now - Duration::hours(1));
+        assert_eq!(d.cutoff(), d.last_mined_at);
+        d.last_dreamed_at = Some(now - Duration::hours(5));
+        assert_eq!(d.cutoff(), d.last_mined_at);
+        d.last_dreamed_at = Some(now);
+        assert_eq!(d.cutoff(), Some(now));
+    }
+
+    #[test]
+    fn discover_uses_last_mined_at_as_cutoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let cd = tmp.path().to_path_buf();
+        let pdir = cd.join("projects").join("-p");
+        std::fs::create_dir_all(pdir.join("memory")).unwrap();
+        std::fs::write(pdir.join("memory/MEMORY.md"), "- x\n").unwrap();
+        write_session(&pdir, "old", Duration::hours(5), now);
+        write_session(&pdir, "new", Duration::hours(1), now);
+        let mut cfg = Config {
+            config_dirs: vec![cd.clone()],
+            ..Config::default()
+        };
+        cfg.limits.min_transcript_bytes = 0;
+        let db = Db::open_memory().unwrap();
+        let found = discover(&cfg, &db, now).unwrap();
+        assert_eq!(found[0].candidate_sessions.len(), 2);
+        db.set_last_mined_at(&found[0].project, now - Duration::hours(3))
+            .unwrap();
+        let found = discover(&cfg, &db, now).unwrap();
+        let ids: Vec<_> = found[0].candidate_sessions.iter().map(|s| &s.id).collect();
+        assert_eq!(ids, vec!["new"]);
+        assert!((found[0].hours_since.unwrap() - 3.0).abs() < 0.01);
+        // --since-days still overrides the cutoff.
+        let found = discover_with(&cfg, &db, now, Some(0), false).unwrap();
+        assert_eq!(found[0].candidate_sessions.len(), 2);
+        // --force ignores last_mined_at (last_dreamed_at is unset here).
+        let found = discover_with(&cfg, &db, now, None, true).unwrap();
+        assert_eq!(found[0].candidate_sessions.len(), 2);
     }
 
     #[test]

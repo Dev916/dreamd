@@ -133,6 +133,10 @@ pub struct Dream {
     pub output_dir: PathBuf,
     pub diff_stats: Option<DiffStats>,
     pub pid: Option<u32>,
+    /// Set by `dreamd archive`: reviewed and set aside (hidden from `list`,
+    /// no longer parks the project).
+    #[serde(default)]
+    pub archived_at: Option<DateTime<Utc>>,
 }
 
 impl Dream {
