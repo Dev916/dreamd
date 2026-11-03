@@ -30,6 +30,10 @@ It mirrors the two things Anthropic ships:
 Everything goes through `claude -p`, so it rides your existing Claude Code
 login. No API key.
 
+For diagrams of the pipeline, the review-loop state machine, the write
+boundaries and the nightly gate, and for where each idea came from, see
+[docs/inspiration-and-design.md](docs/inspiration-and-design.md).
+
 ## Install
 
 ```sh
