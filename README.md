@@ -49,8 +49,8 @@ effective config.
 ```toml
 config_dirs   = ["~/.claude", "~/.claude-revenium", "~/.claude-clever"]
 claude_bin    = "claude"            # SET THIS: absolute path to the real Claude Code binary
-min_hours     = 24                  # gate: hours since the last dream
-min_sessions  = 3                   # gate: candidate sessions since the last dream
+min_hours     = 24                  # gate: hours since the mined-through cutoff
+min_sessions  = 3                   # gate: candidate sessions since that cutoff
 exclude_slugs = []                  # project slugs never dreamed
 port          = 7720                # dreamd serve
 data_dir      = "~/.local/share/dreamd"
@@ -151,20 +151,23 @@ dreamd scan                                   # dreamable projects, candidate se
 dreamd dream -Users-webmech-dev-Tinkering     # by slug, or by the project's cwd
 dreamd dream ~/dev/Tinkering --dry-run        # the plan: sessions to mine, no model calls
 dreamd dream --all --dry-run                  # tonight's plan across every project
-dreamd list                                   # all dreams, newest first
+dreamd list                                   # dreams, newest first (--include-archived for all)
 dreamd show drm_...                           # status, usage/cost, per-session results, summary
 dreamd summary drm_...                        # the aggregator's summary (aggregate.md)
 dreamd diff drm_... | less                    # unified diff memory → dreamed memory
 dreamd apply drm_...                          # swap it in (backup kept)
 dreamd rollback drm_...                       # restore the backup
+dreamd archive drm_...                        # or set it aside without applying
 ```
 
-`dream` options: `--force` (bypass the gate), `--model M` (aggregator model),
+`dream` options: `--force` (bypass the gate, including awaiting review, and
+the mined-through cutoff: candidates are windowed by the last apply only),
+`--model M` (aggregator model),
 `--instructions "..."` (appended to the aggregator prompt verbatim),
 `--sessions id,id` (explicit sessions; bypasses the gate and every cap),
 `--max-sessions N` (overrides `max_sessions_per_dream`), `--since-days N`
 (only transcripts modified in the last N days, replacing both the backfill
-window and the last-dream cutoff; `0` = no window), `--dry-run` (print the
+window and the mined-through cutoff; `0` = no window), `--dry-run` (print the
 plan and run nothing), `--all` (every dreamable project, gate and run caps
 applied; this is what the nightly job runs). `cancel <id>` cancels a pending or running dream.
 `--json` works on the read commands (`scan`, `list`, `show`, `doctor`,
@@ -174,8 +177,8 @@ What a dream does (state is saved to SQLite after each stage):
 
 0. **Discover.** A project is dreamable if its memory dir holds at least one
    `.md`. Candidate sessions are `*.jsonl` of at least `min_transcript_bytes`,
-   newer than the last dream (a never-dreamed project: within the last
-   `backfill_days`) and older than 10 minutes (a file touched in the last 10
+   newer than the project's mined-through cutoff (see The review loop; a
+   never-dreamed project: within the last `backfill_days`) and older than 10 minutes (a file touched in the last 10
    minutes is a live session and is skipped), newest first, capped at 100.
    The gate counts these. A dream mines the newest `max_sessions_per_dream`
    of them; `--all` first plans the whole run (see Quota and caps).
@@ -199,6 +202,38 @@ dir still hashes the same as the snapshot. If you or a session wrote memory
 since, rerun the dream, or pass `--force` to overwrite those writes. It copies
 the live dir to `backup/`, stages `out/` next to the live dir, swaps by
 rename, and records `last_dreamed_at`. `rollback` restores `backup/`.
+
+### The review loop
+
+A completed dream changes nothing until you review it, and dreamd waits for
+you instead of piling up more dreams:
+
+- **Mined-through cutoff.** When a dream reaches `completed`, dreamd records
+  `last_mined_at` for its project (not for `failed` or `canceled` dreams).
+  The project's cutoff is the later of `last_mined_at` and `last_dreamed_at`
+  (set by `apply`): later dreams only mine transcripts modified after it, and
+  `min_hours` counts from it. So an unapplied dream's sessions are never
+  mined twice, and with `auto_apply = false` the nightly `--all` does not
+  re-mine the same newest sessions every night. `scan` shows the cutoff as
+  `last=<timestamp>`; `scan --json` has both `last_dreamed_at` and
+  `last_mined_at`.
+- **Awaiting review parks the project.** While a project has a `completed`
+  dream that is not archived, the gate skips it — before the hours and
+  sessions checks — with `awaiting review: <id> (apply, rollback or archive
+  it)` (`scan` verdict, `dream` exit 2, `POST /v1/dreams` 409 `skipped`). A
+  new dream would start from the live memory dir and lose that dream's
+  insights. `--force` and `--sessions` bypass this, as they bypass the gate.
+- **Unparking.** `apply` (the dream becomes `applied`), `rollback` of an
+  applied dream, or `archive`. `dreamd archive <id>` sets a finished dream
+  (completed, failed, canceled, applied or rolled_back) aside: it records
+  `archived_at`, hides the dream from `list` (`list --include-archived`
+  shows it with an `archived` marker; `show` always works) and stops it
+  parking its project. It refuses a pending or running dream (`refused:
+  dream is running`, exit 3) and is idempotent. Archiving does not move the
+  cutoff back: the archived dream's sessions stay mined.
+
+Upgrading from 0.1.0 adds the two columns on first open. A `completed` dream
+made by 0.1.0 parks its project until you apply or archive it.
 
 Data lives in `~/.local/share/dreamd/`: `dreamd.db`, and per dream
 `dreams/<id>/{in/, in.sha256, out/, findings/<session>.json, context/,
@@ -233,7 +268,12 @@ quota per worker call** that is about $150 of quota in one night. The
   sessions) before anything else, so they neither count toward the gate nor
   get mined.
 - `backfill_days` (14): a project that has never been dreamed only considers
-  the last two weeks; after its first dream the cutoff is the last dream.
+  the last two weeks; after its first completed dream the cutoff is the
+  mined-through time (the later of the last completed dream and the last
+  apply), so nothing is mined twice whether or not you apply.
+- A project with a completed dream awaiting review is skipped entirely
+  (`awaiting review: <id>`), so an unattended `--all` spends nothing on it
+  until you apply, roll back or `archive` that dream (see The review loop).
 - `max_sessions_per_dream` (10): a dream mines the newest 10 candidates.
 - `max_projects_per_run` (5) and `max_sessions_per_run` (30): `dream --all`
   orders due projects by their newest candidate (most recently active first)
@@ -259,7 +299,7 @@ dreamd dream <slug> --since-days 0 --max-sessions 100 --dry-run   # see what it 
 dreamd dream <slug> --since-days 0 --max-sessions 100
 ```
 
-`--since-days 0` removes the window (and the last-dream cutoff) for that run;
+`--since-days 0` removes the window (and the mined-through cutoff) for that run;
 100 is the hosted-API ceiling, the most one dream can take. `--sessions
 id,id` picks exact transcripts and bypasses every cap.
 
@@ -291,13 +331,14 @@ curl -s -H "Authorization: Bearer $TOK" -X POST http://127.0.0.1:7720/v1/dreams/
 | GET | `/healthz` | no token |
 | GET | `/v1/projects` | dreamable projects + gate verdict |
 | POST | `/v1/dreams` | `{project, instructions?, model?, session_ids?, force?}` → 202 with the pending dream; 409 `skipped` when gated, 409 `busy` when the project is already being dreamed |
-| GET | `/v1/dreams[?status=]` | list |
+| GET | `/v1/dreams[?status=&include_archived=true]` | list (archived dreams only with `include_archived=true`) |
 | GET | `/v1/dreams/{id}` | one dream |
 | GET | `/v1/dreams/{id}/diff` | `text/plain` |
 | GET | `/v1/dreams/{id}/sessions` | per-session worker results |
 | POST | `/v1/dreams/{id}/cancel` | |
 | POST | `/v1/dreams/{id}/apply` | 409 on bad status / hash mismatch |
 | POST | `/v1/dreams/{id}/rollback` | |
+| POST | `/v1/dreams/{id}/archive` | 200 with `archived_at` set; 409 `refused` while pending/running |
 
 Errors are RFC 7807 `application/problem+json`. Guards, in order: a `Host`
 other than `127.0.0.1` / `localhost` (bare or with the bound port) → 403; any
@@ -366,8 +407,8 @@ is treated as prompt-injectable. Containment, in layers:
 | --- | --- |
 | 0 | ok |
 | 1 | error (bad config, I/O, `doctor` found a FAIL) |
-| 2 | gate-skipped / nothing to do |
-| 3 | refused: hash mismatch, bad status, unknown dream or project, project busy |
+| 2 | gate-skipped (incl. awaiting review) / nothing to do |
+| 3 | refused: hash mismatch, bad status (incl. archiving a pending/running dream), unknown dream or project, project busy |
 | 4 | dream failed (with `--all`: any project failed) |
 
 ## Troubleshooting
