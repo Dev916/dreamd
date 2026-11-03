@@ -92,7 +92,7 @@ fn doctor_json_output() {
     let out = dreamd(&tmp).args(["doctor", "--json"]).assert().success();
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     let arr = v.as_array().unwrap();
-    assert_eq!(arr.len(), 8);
+    assert_eq!(arr.len(), 9);
     assert!(arr.iter().all(|c| c["ok"] == true));
 }
 

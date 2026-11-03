@@ -272,6 +272,19 @@ impl Db {
         expect_one(n, "dream", id)
     }
 
+    /// Mark a dream `failed` with `error` only while it is still `pending`
+    /// or `running` (atomic w.r.t. the pipeline's own terminal update).
+    /// Returns whether it changed.
+    pub fn fail_if_active(&self, id: &str, error: &str) -> anyhow::Result<bool> {
+        let n = self.conn().execute(
+            "UPDATE dreams SET status = 'failed', error = ?2,
+                 ended_at = COALESCE(ended_at, ?3), pid = NULL
+             WHERE id = ?1 AND status IN ('pending', 'running')",
+            params![id, error, ts(Utc::now())],
+        )?;
+        Ok(n == 1)
+    }
+
     pub fn set_result(
         &self,
         id: &str,

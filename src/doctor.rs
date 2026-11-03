@@ -23,11 +23,29 @@ pub fn run(cfg: &Config) -> Vec<Check> {
         check_database(&cfg.db_path()),
         check_api_token(&cfg.data_dir),
         check_schedule(),
+        check_orphans(cfg),
         check_last_dream(&cfg.db_path()),
     ]
 }
 
 pub use crate::claude::resolve_bin;
+
+/// Sweep dreams left pending/running by a dead process: ok when none,
+/// FAIL with the count swept (the sweep itself repairs them).
+fn check_orphans(cfg: &Config) -> Check {
+    let res =
+        crate::db::Db::open(&cfg.db_path()).and_then(|db| crate::dream::sweep_orphans_in(cfg, &db));
+    let (ok, detail) = match res {
+        Ok(ids) if ids.is_empty() => (true, "none".to_string()),
+        Ok(ids) => (false, format!("{} swept: {}", ids.len(), ids.join(", "))),
+        Err(e) => (false, format!("{e:#}")),
+    };
+    Check {
+        name: "orphaned dreams",
+        ok,
+        detail,
+    }
+}
 
 fn check_claude(bin: &str) -> Check {
     match resolve_bin(bin) {

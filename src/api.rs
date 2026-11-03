@@ -16,7 +16,10 @@
 //! Dreams started here run as background tasks in the server process and
 //! persist their state in SQLite, so the CLI sees them. They record no pid:
 //! cancel (from the API or the CLI) works through the status column, which
-//! the pipeline checks between stages, and never signals the server.
+//! the pipeline checks between stages, and never signals the server. They
+//! hold the project lock like CLI dreams (`POST /v1/dreams` → 409 `busy`
+//! while another live process dreams that project), and `serve` sweeps
+//! orphaned dreams at startup.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -32,7 +35,7 @@ use serde_json::json;
 
 use crate::apply::{self, ApplyError};
 use crate::discover::{self, ScanRow};
-use crate::dream::{self, Ctx, DreamOpts, DreamOutcome};
+use crate::dream::{self, Ctx, DreamOpts, DreamOutcome, Prepared};
 use crate::model::{Dream, DreamStatus, SessionRecord};
 
 /// Shared handler state.
@@ -263,6 +266,10 @@ pub fn router(state: AppState, guard_cfg: Guard) -> Router {
 /// print `listening on http://127.0.0.1:<port>` then `token file: <path>`
 /// (never the token), serve until ctrl-c.
 pub async fn serve(ctx: Ctx, port: u16) -> anyhow::Result<()> {
+    // Dreams left pending/running by a dead process (e.g. a killed server).
+    for id in dream::sweep_orphans(&ctx)? {
+        tracing::warn!("swept orphaned dream {id}");
+    }
     let token = crate::token::ensure(&ctx.cfg.data_dir)?;
     let token_file = crate::token::path(&ctx.cfg.data_dir);
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
@@ -357,16 +364,25 @@ async fn create_dream(
         Ok(dream::prepare(&ctx2, &d, &opts2)?)
     })
     .await?;
-    let pending = match outcome {
-        DreamOutcome::Done(d) => d,
-        DreamOutcome::Skipped(why) => {
+    let prepared = match outcome {
+        Prepared::Ready(p) => p,
+        Prepared::Stop(DreamOutcome::Skipped(why)) => {
             return Err(Problem::new(StatusCode::CONFLICT, "skipped", why));
         }
+        Prepared::Stop(DreamOutcome::Busy(why)) => {
+            return Err(Problem::new(StatusCode::CONFLICT, "busy", why));
+        }
+        Prepared::Stop(DreamOutcome::Done(d)) => {
+            return Err(Problem::from(anyhow::anyhow!(
+                "prepare returned a finished dream: {}",
+                d.id
+            )));
+        }
     };
-    let task_dream = pending.clone();
+    let pending = prepared.dream.clone();
     tokio::spawn(async move {
-        let id = task_dream.id.clone();
-        match dream::execute(&ctx, task_dream, opts).await {
+        let id = prepared.dream.id.clone();
+        match dream::execute(&ctx, prepared, opts).await {
             Ok(d) => tracing::info!("dream {id} {}", d.status),
             Err(e) => tracing::error!("dream {id}: {e:#}"),
         }

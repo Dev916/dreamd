@@ -71,6 +71,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         }
         Command::List => {
             let db = Db::open(&cfg.db_path())?;
+            sweep(&cfg, &db)?;
             let dreams = db.list_dreams(None)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&dreams)?);
@@ -142,6 +143,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Rollback { id } => apply_cmd(&id, None),
         Command::Scan { all_dirs } => {
             let db = Db::open(&cfg.db_path())?;
+            sweep(&cfg, &db)?;
             let found = discover::discover(&cfg, &db, chrono::Utc::now())?;
             let rows: Vec<discover::ScanRow> = found
                 .iter()
@@ -375,6 +377,7 @@ async fn dream_cmd(
     opts: dream::DreamOpts,
 ) -> anyhow::Result<i32> {
     let ctx = dream::Ctx::from_env()?;
+    sweep(&ctx.cfg, &ctx.db)?;
     let found = discover::discover(&ctx.cfg, &ctx.db, chrono::Utc::now())?;
     let targets = discover::select_projects(found, if all { None } else { selector });
     if targets.is_empty() {
@@ -386,7 +389,7 @@ async fn dream_cmd(
         return Ok(EXIT_REFUSED);
     }
     let auto_apply = all && ctx.cfg.schedule.auto_apply && !opts.dry_run;
-    let (mut completed, mut failed) = (0usize, 0usize);
+    let (mut completed, mut failed, mut busy) = (0usize, 0usize, 0usize);
     for d in targets {
         let slug = d.project.slug.clone();
         let outcome = match dream::run_dream(&ctx, d, opts.clone()).await {
@@ -402,6 +405,10 @@ async fn dream_cmd(
         match outcome {
             dream::DreamOutcome::Skipped(_) if opts.dry_run => completed += 1,
             dream::DreamOutcome::Skipped(why) => println!("skipped {slug}: {why}"),
+            dream::DreamOutcome::Busy(why) => {
+                busy += 1;
+                eprintln!("busy {slug}: {why}");
+            }
             dream::DreamOutcome::Done(dr) => match dr.status {
                 DreamStatus::Completed => {
                     completed += 1;
@@ -446,6 +453,8 @@ async fn dream_cmd(
     }
     Ok(if failed > 0 {
         EXIT_FAILED
+    } else if busy > 0 && !all {
+        EXIT_REFUSED
     } else if completed > 0 {
         EXIT_OK
     } else {
@@ -521,6 +530,7 @@ fn apply_cmd(id: &str, force: Option<bool>) -> anyhow::Result<i32> {
 /// `cancel`: mark a pending/running dream canceled and SIGTERM its process.
 fn cancel_cmd(cfg: &config::Config, id: &str) -> anyhow::Result<i32> {
     let db = Db::open(&cfg.db_path())?;
+    sweep(cfg, &db)?;
     let Some(d) = db.get_dream(id)? else {
         eprintln!("dream not found: {id}");
         return Ok(EXIT_REFUSED);
@@ -531,7 +541,7 @@ fn cancel_cmd(cfg: &config::Config, id: &str) -> anyhow::Result<i32> {
     }
     db.update_status(id, DreamStatus::Canceled, None)?;
     if let Some(pid) = d.pid.filter(|p| *p != std::process::id()) {
-        if pid_alive(pid) {
+        if dreamd::lock::pid_alive(pid) {
             let _ = std::process::Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
                 .status();
@@ -541,12 +551,12 @@ fn cancel_cmd(cfg: &config::Config, id: &str) -> anyhow::Result<i32> {
     Ok(EXIT_OK)
 }
 
-fn pid_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+/// Fail dreams orphaned by a dead process; one stderr line per dream.
+fn sweep(cfg: &config::Config, db: &Db) -> anyhow::Result<()> {
+    for id in dream::sweep_orphans_in(cfg, db)? {
+        eprintln!("swept orphaned dream {id}");
+    }
+    Ok(())
 }
 
 /// Human-readable `show` output.

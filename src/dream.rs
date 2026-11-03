@@ -22,6 +22,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::discover::{candidate_sessions, gate, DiscoveredProject, Gate};
 use crate::fsops::{copy_dir, hash_dir, unified_diff};
+use crate::lock::{LockError, ProjectLock};
 use crate::model::{Dream, DreamStatus, SessionFile, SessionRecord, SessionStatus, Usage};
 use crate::notify::notify;
 use crate::postcheck::{apply_delete_manifest, check, check_escapes, snapshot_mtimes};
@@ -82,7 +83,29 @@ pub enum DreamOutcome {
     Skipped(String),
     /// A dream was created; its final state (completed, failed or canceled).
     Done(Dream),
+    /// Another live process is dreaming this project (the lock error text).
+    Busy(String),
 }
+
+/// A `Pending` dream inserted by [`prepare`], with the project lock that
+/// [`execute`] holds until the dream reaches a terminal status.
+#[derive(Debug)]
+pub struct PreparedDream {
+    pub dream: Dream,
+    pub lock: ProjectLock,
+}
+
+/// What [`prepare`] produced: a dream ready to [`execute`], or the outcome
+/// that ends the request here (`Skipped` or `Busy`).
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum Prepared {
+    Ready(PreparedDream),
+    Stop(DreamOutcome),
+}
+
+/// The error recorded on a dream whose owning process died.
+pub const ORPHANED: &str = "orphaned: owning process died";
 
 /// `<dreams_dir>/<id>`.
 pub fn dream_dir(cfg: &Config, id: &str) -> PathBuf {
@@ -156,18 +179,20 @@ pub async fn run_dream(
     opts: DreamOpts,
 ) -> anyhow::Result<DreamOutcome> {
     match prepare(ctx, &d, &opts)? {
-        DreamOutcome::Done(dream) => Ok(DreamOutcome::Done(execute(ctx, dream, opts).await?)),
-        skipped => Ok(skipped),
+        Prepared::Ready(p) => Ok(DreamOutcome::Done(execute(ctx, p, opts).await?)),
+        Prepared::Stop(outcome) => Ok(outcome),
     }
 }
 
-/// Gate, select sessions and insert the `Pending` dream row. `Skipped` when
-/// the gate says no, no sessions qualify, or `opts.dry_run` (which prints
-/// the plan). Fast and synchronous, so the API can answer 202 with the row.
-pub fn prepare(ctx: &Ctx, d: &DiscoveredProject, opts: &DreamOpts) -> anyhow::Result<DreamOutcome> {
+/// Gate, select sessions, take the project lock and insert the `Pending`
+/// dream row. `Skipped` when the gate says no, no sessions qualify, or
+/// `opts.dry_run` (which prints the plan); `Busy` when another live process
+/// holds the project's lock. Fast and synchronous, so the API can answer 202
+/// with the row.
+pub fn prepare(ctx: &Ctx, d: &DiscoveredProject, opts: &DreamOpts) -> anyhow::Result<Prepared> {
     let sessions = match select_sessions(ctx, d, opts) {
         Ok(s) => s,
-        Err(why) => return Ok(DreamOutcome::Skipped(why)),
+        Err(why) => return Ok(Prepared::Stop(DreamOutcome::Skipped(why))),
     };
     if opts.dry_run {
         println!(
@@ -187,8 +212,18 @@ pub fn prepare(ctx: &Ctx, d: &DiscoveredProject, opts: &DreamOpts) -> anyhow::Re
                 Err(e) => println!("  {}  unreadable: {e:#}", s.id),
             }
         }
-        return Ok(DreamOutcome::Skipped("dry run".into()));
+        return Ok(Prepared::Stop(DreamOutcome::Skipped("dry run".into())));
     }
+
+    // Lock before the row exists, so a pending/running row always has a
+    // lock (the orphan sweep relies on it).
+    let lock = match ProjectLock::acquire(&ctx.cfg, &d.project) {
+        Ok(l) => l,
+        Err(e @ LockError::Held { .. }) => {
+            return Ok(Prepared::Stop(DreamOutcome::Busy(e.to_string())))
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     let id = Dream::new_id();
     let dir = dream_dir(&ctx.cfg, &id);
@@ -214,13 +249,15 @@ pub fn prepare(ctx: &Ctx, d: &DiscoveredProject, opts: &DreamOpts) -> anyhow::Re
     };
     ctx.db.upsert_project(&d.project)?;
     ctx.db.insert_dream(&dream)?;
-    Ok(DreamOutcome::Done(dream))
+    Ok(Prepared::Ready(PreparedDream { dream, lock }))
 }
 
 /// Run the pipeline for a dream inserted by [`prepare`] and return its final
 /// state (completed, failed or canceled). Session transcripts are the
-/// dream's `session_ids` under `<config_dir>/projects/<slug>/`.
-pub async fn execute(ctx: &Ctx, dream: Dream, opts: DreamOpts) -> anyhow::Result<Dream> {
+/// dream's `session_ids` under `<config_dir>/projects/<slug>/`. The project
+/// lock is released when this returns.
+pub async fn execute(ctx: &Ctx, prepared: PreparedDream, opts: DreamOpts) -> anyhow::Result<Dream> {
+    let PreparedDream { dream, lock: _lock } = prepared;
     let id = dream.id.clone();
     let dir = dream_dir(&ctx.cfg, &id);
     let project_dir = dream
@@ -476,6 +513,27 @@ fn pending_record(sid: &str, path: &Path) -> SessionRecord {
         error: None,
         duration_ms: 0,
     }
+}
+
+/// Mark every `pending`/`running` dream whose project lock has no live
+/// holder `failed` (`orphaned: owning process died`); returns their ids.
+pub fn sweep_orphans(ctx: &Ctx) -> anyhow::Result<Vec<String>> {
+    sweep_orphans_in(&ctx.cfg, &ctx.db)
+}
+
+/// [`sweep_orphans`] without a full `Ctx` (no claude binary needed).
+pub fn sweep_orphans_in(cfg: &Config, db: &Db) -> anyhow::Result<Vec<String>> {
+    let mut swept = Vec::new();
+    for status in [DreamStatus::Pending, DreamStatus::Running] {
+        for d in db.list_dreams(Some(status))? {
+            if crate::lock::holder(cfg, &d.project).is_none()
+                && db.fail_if_active(&d.id, ORPHANED)?
+            {
+                swept.push(d.id);
+            }
+        }
+    }
+    Ok(swept)
 }
 
 /// Number of sessions that mined successfully.

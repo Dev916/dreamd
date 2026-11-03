@@ -13,6 +13,7 @@ pub mod discover;
 pub mod doctor;
 pub mod dream;
 pub mod fsops;
+pub mod lock;
 pub mod model;
 pub mod notify;
 pub mod postcheck;

@@ -426,6 +426,21 @@ async fn api_end_to_end() {
         assert!(start_t.elapsed() < Duration::from_secs(10), "{d}");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // A second dream of the same project while this one runs → 409 busy.
+    let r = c
+        .post(format!("{base}/v1/dreams"))
+        .json(&json!({"project": common::SLUG, "force": true}))
+        .send()
+        .await
+        .unwrap();
+    let body = problem(r, StatusCode::CONFLICT, "busy").await;
+    assert_eq!(
+        body["detail"],
+        format!(
+            "project is already being dreamed by pid {}",
+            std::process::id()
+        )
+    );
     let r = c
         .post(format!("{base}/v1/dreams/{slow_id}/cancel"))
         .send()
@@ -448,6 +463,17 @@ async fn api_end_to_end() {
         .as_str()
         .unwrap()
         .contains("dream is canceled"));
+
+    // The canceled dream's task releases the project lock when it returns.
+    let start_t = Instant::now();
+    let locks = f.data_dir.join("locks");
+    while std::fs::read_dir(&locks).is_ok_and(|mut d| d.next().is_some()) {
+        assert!(
+            start_t.elapsed() < Duration::from_secs(10),
+            "lock not released"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // Create → 202 → completed.
     let r = c
